@@ -832,6 +832,47 @@ def policy_loss_function(
     return loss, reported_loss
 
 
+def subtb_loss_function(args, batch, logits, sum_of_sample_mean):
+    """Two blocks of the same SubTB gradient, with synchronized cached peers."""
+    from slime.utils.subtb import subtb_loss
+
+    is_flow = args.loss_type == "subtb_flow_loss"
+    extractor = get_values if is_flow else get_log_probs_and_entropy
+    _, current = extractor(
+        logits, args=args, unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"], response_lengths=batch["response_lengths"],
+        max_seq_lens=batch.get("max_seq_lens", None),
+    )
+    flows = current["values"] if is_flow else batch["values"]
+    log_probs = batch["log_probs"] if is_flow else current["log_probs"]
+    losses = []
+    component_losses = {}
+    for index, (lp, ref, flow, reward, mask, sample_id) in enumerate(zip(
+        log_probs, batch["ref_log_probs"], flows, batch["rewards"],
+        batch["loss_masks"], batch["sample_indices"], strict=True,
+    )):
+        if not bool((mask == 1).all()):
+            raise ValueError("NTP SubTB requires complete, unmasked trajectories")
+        loss, components = subtb_loss(
+            lp.flatten(), ref.flatten(), flow.flatten(), reward,
+            alpha=args.subtb_alpha, num_spans=args.subtb_num_spans,
+            seed=args.subtb_seed + int(sample_id), sampling=args.subtb_sampling,
+            window_size=args.subtb_window_size, num_windows=args.subtb_num_windows,
+            length_lambda=args.subtb_length_lambda, full_weight=args.subtb_full_weight,
+            return_components=True,
+        )
+        # The existing reducer computes a sum of per-sequence means.
+        losses.append(loss.expand(batch["response_lengths"][index]))
+        for key, value in components.items():
+            component_losses.setdefault(key, []).append(value.expand(batch["response_lengths"][index]))
+    loss = sum_of_sample_mean(torch.cat(losses))
+    name = "subtb_flow_loss" if is_flow else "subtb_loss"
+    metrics = {name: loss.detach().clone()}
+    metrics.update({f"subtb_{key}": sum_of_sample_mean(torch.cat(values))
+                    for key, values in component_losses.items()})
+    return loss, metrics
+
+
 def value_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -995,6 +1036,8 @@ def loss_function(
             func = policy_loss_function
         case "value_loss":
             func = value_loss_function
+        case "subtb_loss" | "subtb_flow_loss":
+            func = subtb_loss_function
         case "sft_loss":
             func = sft_loss_function
         case "custom_loss":

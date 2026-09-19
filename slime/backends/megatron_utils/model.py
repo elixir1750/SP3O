@@ -369,6 +369,8 @@ def train_one_step(
                 "values",
                 "advantages",
                 "returns",
+                "rewards",
+                "sample_indices",
                 "rollout_log_probs",
                 "max_seq_lens",
                 "teacher_log_probs",

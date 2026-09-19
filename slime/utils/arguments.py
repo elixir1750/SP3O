@@ -780,7 +780,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft_loss", "custom_loss"],
+                choices=["policy_loss", "sft_loss", "custom_loss", "subtb_loss"],
                 default="policy_loss",
                 help=(
                     "Choose loss type, currently support ppo policy_loss or sft_loss, "
@@ -1622,7 +1622,7 @@ def slime_validate_args(args):
         )
         args.debug_train_only = True
 
-    args.use_critic = args.advantage_estimator == "ppo"
+    args.use_critic = args.advantage_estimator == "ppo" or args.loss_type == "subtb_loss"
     if args.critic_train_only:
         if not args.use_critic:
             raise ValueError("--critic-train-only requires --use-critic (or --advantage-estimator ppo).")

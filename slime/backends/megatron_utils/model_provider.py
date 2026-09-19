@@ -29,6 +29,7 @@ class LinearForLastLayer(torch.nn.Linear):
         *,
         config: TransformerConfig,
         bias: bool = True,
+        zero_init: bool = False,
     ) -> None:
         super().__init__(in_features=input_size, out_features=output_size, bias=bias)
         self.sequence_parallel = config.sequence_parallel
@@ -37,7 +38,10 @@ class LinearForLastLayer(torch.nn.Linear):
             if bias:
                 self.bias.sequence_parallel = True
 
-        self.weight.data.normal_(mean=0.0, std=0.02)
+        if zero_init:
+            self.weight.data.zero_()
+        else:
+            self.weight.data.normal_(mean=0.0, std=0.02)
         if bias:
             self.bias.data.zero_()
 
@@ -58,6 +62,12 @@ def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
+    # Initialization happens before checkpoint loading; resume restores learned
+    # heads normally. PPO/SP3O retain their original random scalar head.
+    zero_flow_head = (
+        getattr(args, "loss_type", None) == "subtb_loss"
+        and getattr(args, "subtb_flow_init", "zero") == "zero"
+    )
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 
@@ -74,7 +84,7 @@ def get_model_provider_func(
             # Apply critic output layer if needed
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
+                    input_size=model.config.hidden_size, output_size=1, config=model.config, zero_init=zero_flow_head
                 )
             return model
 
@@ -110,7 +120,7 @@ def get_model_provider_func(
                 model = _original_provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
                 if post_process:
                     model.output_layer = LinearForLastLayer(
-                        input_size=model.config.hidden_size, output_size=1, config=model.config
+                        input_size=model.config.hidden_size, output_size=1, config=model.config, zero_init=zero_flow_head
                     )
                 return model
 
@@ -221,7 +231,7 @@ def get_model_provider_func(
             model = GPTModel(**kwargs)
 
         if post_process and role == "critic":
-            model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+            model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config, zero_init=zero_flow_head)
 
         return model
 

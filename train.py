@@ -4,6 +4,7 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, update_tracking_open_metrics
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.subtb import add_subtb_arguments, validate_subtb_args
 from slime.utils.sp3o import add_sp3o_arguments, validate_sp3o_args
 
 
@@ -107,6 +108,7 @@ def train(args):
 
 
 if __name__ == "__main__":
-    args = parse_args(add_custom_arguments=add_sp3o_arguments)
+    args = parse_args(add_custom_arguments=lambda parser: add_subtb_arguments(add_sp3o_arguments(parser)))
+    validate_subtb_args(args)
     validate_sp3o_args(args)
     train(args)

@@ -687,7 +687,21 @@ class RolloutManager:
         if self.custom_convert_samples_to_train_data_func is not None:
             return self.custom_convert_samples_to_train_data_func(self.args, samples)
 
+        if self.args.loss_type == "subtb_loss":
+            # A bounded task: EOS is terminal; hitting exactly H actions is also
+            # terminal by definition. An aborted partial prefix is never terminal.
+            from slime.utils.processing_utils import load_tokenizer
+
+            if not hasattr(self, "_subtb_eos_id"):
+                self._subtb_eos_id = load_tokenizer(self.args.hf_checkpoint, trust_remote_code=True).eos_token_id
+            from slime.utils.subtb import validate_subtb_sample
+
+            for sample in samples:
+                validate_subtb_sample(sample, self._subtb_eos_id, self.args.rollout_max_response_len)
+
         raw_rewards, rewards = self._post_process_rewards(samples)
+        if self.args.loss_type == "subtb_loss":
+            rewards = raw_rewards
 
         assert len(raw_rewards) == len(samples)
         assert len(rewards) == len(samples)

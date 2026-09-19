@@ -391,9 +391,11 @@ class MegatronTrainRayActor(TrainRayActor):
         if rollout_id >= self.args.num_critic_only_steps and not self.args.critic_train_only:
             sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
 
-        compute_advantages_and_returns(self.args, rollout_data)
-
-        self.args.loss_type = "value_loss"
+        if self.args.loss_type not in ("subtb_loss", "subtb_flow_loss"):
+            compute_advantages_and_returns(self.args, rollout_data)
+            self.args.loss_type = "value_loss"
+        else:
+            self.args.loss_type = "subtb_flow_loss"
         train(
             rollout_id,
             self.model,
@@ -465,7 +467,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
-                compute_advantages_and_returns(self.args, rollout_data)
+                if self.args.loss_type != "subtb_loss":
+                    compute_advantages_and_returns(self.args, rollout_data)
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)

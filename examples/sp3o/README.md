@@ -8,8 +8,16 @@ This implementation is based on slime `v0.2.4` (`bd217a63`).
 
 Install slime and Megatron-LM by following the upstream
 [quick-start guide](../../docs/en/get_started/quick_start.md). The three runs
-use Qwen3-4B-Base on eight GPUs: four colocated actor/critic GPUs and four
-rollout GPUs. Resource parameters can be overridden for another topology.
+default to Qwen3-4B-Base. PPO and SP3O use eight GPUs: four for the actor
+and four for the critic, with rollout reusing the allocation through
+colocation/offloading. GRPO does not instantiate a critic. Resource parameters
+can be overridden for another topology. Set `MODEL_SIZE=8B` and supply matching
+Qwen3-8B-Base checkpoint paths for the paper's larger model.
+
+When initializing a critic directly from a Hugging Face checkpoint, the
+pretrained backbone is loaded and the scalar value head keeps its random
+initialization. The vocabulary output head is not loaded into the critic.
+Resuming a saved Megatron critic checkpoint restores its trained value head.
 
 Training data must be JSONL. Each row contains a chat-formatted `prompt`, a
 `label` string or list of strings, and optionally `metadata.points` for
@@ -46,6 +54,12 @@ bash examples/sp3o/train_grpo.sh
 bash examples/sp3o/train_sp3o.sh
 ```
 
+On a managed cluster, run these commands only inside the scheduler allocation.
+The launcher does not request resources itself. `SEQ_LENGTH` and
+`CUDA_GRAPH_MAX_BATCH_SIZE` can be reduced for smoke tests; additional slime
+arguments can be passed through each launcher. Defaults retain the main-run
+configuration. A short smoke checks execution, not the paper's benchmark scores.
+
 The `sp3o` preset supervises relative response positions `0.3/0.6/0.9` and
 adds `0.95` when a response has at least 6144 valid tokens. PPO critic warm-up
 is dense for the first 20 rollout batches. Set `NUM_CRITIC_ONLY_STEPS` only
@@ -74,3 +88,9 @@ of this reference implementation.
 
 Invalid ratios, missing selectors, or inconsistent warm-up settings fail before
 training begins.
+
+## Experimental NTP SubTB
+
+`train_subtb.sh` trains an actor and relative log-flow model with SubTB and a
+fixed reference policy. It replaces the PPO objective. See [SUBTB.md](SUBTB.md)
+for the target distribution, terminal convention, and supported configuration.

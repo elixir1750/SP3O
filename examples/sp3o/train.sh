@@ -7,6 +7,11 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 PRESET="${PRESET:-sp3o}"
 SEED="${SEED:-1234}"
 DRY_RUN="${DRY_RUN:-0}"
+MODEL_SIZE="${MODEL_SIZE:-4B}"
+case "${MODEL_SIZE}" in
+    4B|8B) ;;
+    *) echo "Unsupported MODEL_SIZE: ${MODEL_SIZE}" >&2; exit 2 ;;
+esac
 
 required=(HF_CHECKPOINT MEGATRON_CHECKPOINT PROMPT_DATA OUTPUT_DIR MEGATRON_LM)
 for name in "${required[@]}"; do
@@ -17,13 +22,13 @@ for name in "${required[@]}"; do
 done
 
 case "${PRESET}" in
-    ppo|grpo|sp3o) ;;
+    ppo|grpo|sp3o|subtb) ;;
     *) echo "Unknown PRESET: ${PRESET}" >&2; exit 2 ;;
 esac
 
 # shellcheck source=/dev/null
-source "${REPO_ROOT}/scripts/models/qwen3-4B.sh"
-MODEL_ARGS+=(--max-position-embeddings 32768 --seq-length 32768)
+source "${REPO_ROOT}/scripts/models/qwen3-${MODEL_SIZE}.sh"
+MODEL_ARGS+=(--max-position-embeddings "${SEQ_LENGTH:-32768}" --seq-length "${SEQ_LENGTH:-32768}")
 
 CRITIC_RATIOS=(0.3 0.6 0.9)
 
@@ -34,19 +39,23 @@ MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-8192}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-9216}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-64}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
+if [[ "$PRESET" == subtb ]]; then
+    NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
+    NUM_CRITIC_ONLY_STEPS=0
+fi
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-2}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-1000}"
 NUM_CRITIC_ONLY_STEPS="${NUM_CRITIC_ONLY_STEPS:-20}"
 OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-$((2 * ROLLOUT_BATCH_SIZE))}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-Qwen3-4B-Base-${PRESET}-seed${SEED}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-Qwen3-${MODEL_SIZE}-Base-${PRESET}-seed${SEED}}"
 RUN_DIR="${OUTPUT_DIR%/}/${EXPERIMENT_NAME}"
 if [[ ! "${NUM_CRITIC_ONLY_STEPS}" =~ ^[0-9]+$ ]]; then
     echo "NUM_CRITIC_ONLY_STEPS must be a non-negative integer" >&2
     exit 2
 fi
 CUDA_GRAPH_BATCH_SIZES=(1 2 4 8)
-for ((batch_size = 16; batch_size <= 256; batch_size += 8)); do
+for ((batch_size = 16; batch_size <= ${CUDA_GRAPH_MAX_BATCH_SIZE:-256}; batch_size += 8)); do
     CUDA_GRAPH_BATCH_SIZES+=("${batch_size}")
 done
 
@@ -75,7 +84,6 @@ ARGS=(
     --rollout-max-response-len "${MAX_RESPONSE_LEN}"
     --rollout-temperature 1.0
     --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
-    --partial-rollout
     --balance-data
     --optimizer adam
     --lr 1e-6
@@ -104,9 +112,21 @@ ARGS=(
     --accumulate-allreduce-grads-in-fp32
     --attention-softmax-in-fp32
     --attention-backend flash
-    --use-tis
     --seed "${SEED}"
 )
+
+if [[ "$PRESET" == subtb ]]; then
+    ARGS+=(--loss-type subtb_loss --subtb-alpha "${SUBTB_ALPHA:-1.0}"
+           --subtb-num-spans "${SUBTB_NUM_SPANS:-64}"
+           --subtb-flow-init "${SUBTB_FLOW_INIT:-zero}"
+           --subtb-sampling "${SUBTB_SAMPLING:-window}"
+           --subtb-window-size "${SUBTB_WINDOW_SIZE:-64}"
+           --subtb-num-windows "${SUBTB_NUM_WINDOWS:-4}"
+           --subtb-length-lambda "${SUBTB_LENGTH_LAMBDA:-1.0}"
+           --subtb-full-weight "${SUBTB_FULL_WEIGHT:-0.1}")
+else
+    ARGS+=(--partial-rollout --use-tis)
+fi
 
 if [[ "${PRESET}" == "grpo" ]]; then
     ARGS+=(
@@ -153,7 +173,7 @@ if [[ -n "${EVAL_CONFIG:-}" ]]; then
     )
 fi
 
-if [[ -n "${WANDB_API_KEY:-}" ]]; then
+if [[ "${USE_WANDB:-0}" == 1 || -n "${WANDB_API_KEY:-}" || "$PRESET" == subtb ]]; then
     ARGS+=(
         --use-wandb
         --wandb-project "${WANDB_PROJECT:-SP3O}"
@@ -164,12 +184,16 @@ if [[ -n "${WANDB_API_KEY:-}" ]]; then
     )
 fi
 
+if [[ -n "${WANDB_ENTITY:-}" ]]; then ARGS+=(--wandb-team "$WANDB_ENTITY"); fi
+
+ARGS+=("$@")
+
 DISPLAY_ANCHORS="dense"
 if [[ "${PRESET}" == "sp3o" ]]; then
     DISPLAY_ANCHORS="${CRITIC_RATIOS[*]}"
 fi
 printf 'SP3O configuration: model=%s preset=%s seed=%s anchors=%s\n' \
-    "Qwen3-4B-Base" "${PRESET}" "${SEED}" "${DISPLAY_ANCHORS}"
+    "Qwen3-${MODEL_SIZE}-Base" "${PRESET}" "${SEED}" "${DISPLAY_ANCHORS}"
 printf 'Command:'
 printf ' %q' python3 train.py "${ARGS[@]}"
 printf '\n'

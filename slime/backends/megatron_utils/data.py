@@ -637,7 +637,7 @@ def sync_actor_critic_data(
     for value in values:
         handles.append(dist.broadcast(value, src=1, group=group, async_op=True))
 
-    if args.kl_coef != 0 or args.use_kl_loss:
+    if args.kl_coef != 0 or args.use_kl_loss or args.loss_type in ("subtb_loss", "subtb_flow_loss"):
         if not log_probs:
             log_probs = [torch.empty_like(value) for value in values]
         if not ref_log_probs:
