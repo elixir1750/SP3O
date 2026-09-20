@@ -847,6 +847,7 @@ def subtb_loss_function(args, batch, logits, sum_of_sample_mean):
     log_probs = batch["log_probs"] if is_flow else current["log_probs"]
     losses = []
     component_losses = {}
+    root_values = []
     for index, (lp, ref, flow, reward, mask, sample_id) in enumerate(zip(
         log_probs, batch["ref_log_probs"], flows, batch["rewards"],
         batch["loss_masks"], batch["sample_indices"], strict=True,
@@ -863,11 +864,15 @@ def subtb_loss_function(args, batch, logits, sum_of_sample_mean):
         )
         # The existing reducer computes a sum of per-sequence means.
         losses.append(loss.expand(batch["response_lengths"][index]))
+        # g at the state before the first response action, i.e. log Z(q) at the
+        # fixed point. This is the quantity a flow-only warmup has to fit.
+        root_values.append(flow.flatten()[0])
         for key, value in components.items():
             component_losses.setdefault(key, []).append(value.expand(batch["response_lengths"][index]))
     loss = sum_of_sample_mean(torch.cat(losses))
     name = "subtb_flow_loss" if is_flow else "subtb_loss"
     metrics = {name: loss.detach().clone()}
+    metrics["subtb_root_value"] = torch.stack(root_values).mean().detach()
     metrics.update({f"subtb_{key}": sum_of_sample_mean(torch.cat(values))
                     for key, values in component_losses.items()})
     return loss, metrics

@@ -94,7 +94,7 @@ ARGS=(
     --optimizer-cpu-offload
     --overlap-cpu-optimizer-d2h-h2d
     --use-precision-aware-optimizer
-    --tensor-model-parallel-size "${ACTOR_GPUS}"
+    --tensor-model-parallel-size "${TP_SIZE:-${ACTOR_GPUS}}"
     --sequence-parallel
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
@@ -119,6 +119,9 @@ if [[ "$PRESET" == subtb ]]; then
     ARGS+=(--loss-type subtb_loss --subtb-alpha "${SUBTB_ALPHA:-1.0}"
            --subtb-num-spans "${SUBTB_NUM_SPANS:-64}"
            --subtb-flow-init "${SUBTB_FLOW_INIT:-zero}"
+           --subtb-flow-inner-steps "${SUBTB_FLOW_INNER_STEPS:-1}"
+           --subtb-flow-warmup-steps "${SUBTB_FLOW_WARMUP_STEPS:-0}"
+           --subtb-seed "${SUBTB_SEED:-1234}"
            --subtb-sampling "${SUBTB_SAMPLING:-window}"
            --subtb-window-size "${SUBTB_WINDOW_SIZE:-64}"
            --subtb-num-windows "${SUBTB_NUM_WINDOWS:-4}"
@@ -147,7 +150,7 @@ else
         --eps-clip-high 0.2
         --lambd 1.0
         --num-critic-only-steps "${NUM_CRITIC_ONLY_STEPS}"
-        --critic-lr 4e-6
+        --critic-lr "${CRITIC_LR:-4e-6}"
         --critic-num-nodes 1
         --critic-num-gpus-per-node "${ACTOR_GPUS}"
         --critic-save "${RUN_DIR}/critic"

@@ -4,7 +4,7 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, update_tracking_open_metrics
 from slime.utils.misc import should_run_periodic_action
-from slime.utils.subtb import add_subtb_arguments, validate_subtb_args
+from slime.utils.subtb import add_subtb_arguments, subtb_flow_warmup_active, validate_subtb_args
 from slime.utils.sp3o import add_sp3o_arguments, validate_sp3o_args
 
 
@@ -73,6 +73,11 @@ def train(args):
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
+        # SubTB may ramp in with flow-only warmup rounds. The actor process is still
+        # started (it must publish log-probs and reference log-probs for the flow) but
+        # skips its optimizer step, so its weights are unchanged.
+        warmup = subtb_flow_warmup_active(args, rollout_id)
+
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
             ray.get(rollout_manager.eval.remote(rollout_id))
 
@@ -95,12 +100,14 @@ def train(args):
         offload_train(rollout_id)
         if args.offload_rollout:
             ray.get(rollout_manager.onload_weights.remote())
-        if not args.critic_train_only:
+        if not args.critic_train_only and not warmup:
             actor_model.update_weights()
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())
 
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+        # Warmup rounds cannot change the actor, so their evaluations would just
+        # repeat the baseline measurement.
+        if not warmup and should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
     ray.get(rollout_manager.dispose.remote())

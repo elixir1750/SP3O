@@ -22,6 +22,26 @@ def add_subtb_arguments(parser):
     parser.add_argument("--subtb-length-lambda", type=float, default=1.0)
     parser.add_argument("--subtb-full-weight", type=float, default=0.1)
     parser.add_argument("--subtb-seed", type=int, default=1234)
+    parser.add_argument(
+        "--subtb-flow-inner-steps",
+        type=int,
+        default=1,
+        help=(
+            "Flow optimizer steps per rollout. All steps reuse the actor's cached "
+            "log-probs/rewards of that rollout, which keeps the fast (flow) variable "
+            "ahead of the slow (actor) one. The actor still takes one step per rollout."
+        ),
+    )
+    parser.add_argument(
+        "--subtb-flow-warmup-steps",
+        type=int,
+        default=0,
+        help=(
+            "Leading rollouts that only fit the flow: the actor still runs the "
+            "reference/actor forwards that publish log-probs, but takes no optimizer "
+            "step and its weights are not re-synchronised to the rollout engines."
+        ),
+    )
     return parser
 
 
@@ -58,6 +78,28 @@ def validate_subtb_args(args):
         raise ValueError("SubTB does not support OPD")
     if args.actor_num_nodes != args.critic_num_nodes or args.actor_num_gpus_per_node != args.critic_num_gpus_per_node:
         raise ValueError("SubTB requires matching actor/flow parallel topology")
+    if args.subtb_flow_inner_steps < 1:
+        raise ValueError("SubTB flow inner steps must be positive")
+    if args.subtb_flow_warmup_steps < 0:
+        raise ValueError("SubTB flow warmup steps must be nonnegative")
+    if args.subtb_flow_warmup_steps:
+        if not getattr(args, "use_critic", True):
+            raise ValueError("SubTB flow warmup requires the flow model (critic role)")
+        if getattr(args, "num_rollout", 0) <= args.subtb_flow_warmup_steps:
+            raise ValueError("SubTB flow warmup must leave at least one joint rollout")
+
+
+def subtb_flow_warmup_active(args, rollout_id: int) -> bool:
+    """True while the actor is frozen so that the flow can be fitted first.
+
+    The actor must still run its forwards during warmup: the flow's residual needs
+    the actor's log-probs and the reference log-probs. Only the actor's optimizer
+    step and the weight synchronisation to the rollout engines are skipped.
+    """
+    if getattr(args, "loss_type", None) not in ("subtb_loss", "subtb_flow_loss"):
+        return False
+    warmup_steps = getattr(args, "subtb_flow_warmup_steps", 0) or 0
+    return warmup_steps > 0 and rollout_id < warmup_steps
 
 
 def validate_subtb_sample(sample, eos_id, horizon):

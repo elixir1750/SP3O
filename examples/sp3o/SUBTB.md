@@ -91,16 +91,53 @@ lengths and mean relative flow are also recorded by the existing logging path.
 Before each update, workers cache and exchange current policy log probabilities,
 reference log probabilities and current flow predictions. The actor computes
 its gradient using detached flow predictions; the flow model computes its
-gradient using detached policy probabilities. With one optimizer step per
-rollout and zero dropout, these are the two partial derivatives of the same
-joint objective at the same parameter snapshot. Gradient clipping and optimizer
-settings still apply independently to the two models.
+gradient using detached policy probabilities. The actor takes exactly one
+optimizer step per rollout, always against the flow snapshot published at the
+start of that rollout, so both blocks see the same parameters for the data they
+consume.
+
+Fit the flow before letting the actor move. With a zero-initialised flow and a
+single flow step per rollout, the actor moves the per-trajectory log-ratio
+`sum_t log pi/p_ref` by roughly one nat in one step, while the flow's scalar
+head moves by order 1e-3 nat per step: the baseline lags by two orders of
+magnitude and the residual is dominated by the un-baselined log-ratio instead of
+the reward tilt. `--subtb-flow-warmup-steps W` therefore keeps the actor frozen
+for the first `W` rollouts (its reference/actor forwards still run and still
+publish log-probs, only its optimizer step and the weight sync to the rollout
+engines are skipped), and `--subtb-flow-inner-steps K` lets the flow take `K`
+optimizer steps per rollout on that rollout's cached actor snapshot. Because the
+flow does not influence sampling, those extra steps need no extra rollouts and
+no actor-side replay. This is a two-timescale scheme, not joint SGD: the loss is
+the same, gradient clipping and the two optimizers still act independently, and
+the actor remains strictly on-policy with one step per rollout.
+
+During warmup the actor is exactly the reference, so the flow loss degenerates
+to a consistency regression whose fixed point is `g(s) -> E[r/alpha | s]` and
+`g(s0) -> log Z(q) = log E_p_ref[exp(r/alpha)]`. `train/subtb_root_value`
+reports `g(s0)`, so warmup is judged against `log(1 - p + p e)` for the observed
+reward rate `p` (about 0.22 at p ~ 0.14), not against the loss level, which is
+already near its reward-variance floor before the flow is fitted.
+
+Signal-free groups are dropped before they reach the objective
+(`--dynamic-sampling-filter-path local.lumia.scripts.subtb_group_filter`). A
+group is discarded when every response is TRUNCATED, or when all of its rewards
+are identical: the tilted target `p_ref exp(r/alpha)/Z` gives such a group no
+reward-driven direction, and in the fully truncated case the round also costs
+about 3x the rollout time (measured 765s versus 250s for a normal round in job
+113925). The data source refills the batch, so the trained batch is still
+`rollout_batch_size x n_samples_per_prompt`; drop counts are logged as
+`rollout/dynamic_filter/drop_<reason>`. This deliberately shifts the *training*
+prompt distribution towards questions with mixed outcomes, so it must be
+reported with the results; the held-out evaluation set is untouched and stays
+the unbiased measurement.
 
 The first implementation enforces one global batch per rollout, matching
 actor/flow topology, Megatron, CP=PP=1, temperature 1, zero dropout, complete
 unmasked responses, and a fixed reference. Partial rollout, PPO TIS and moving
-reference updates are disabled. It does not add replay, MTP actions, or claim
-convergence. Other PPO/GRPO/SP3O presets retain their existing behavior.
+reference updates are disabled. `num_critic_only_steps` must stay zero: that
+knob also removes the actor forwards and the actor/flow sync the flow objective
+depends on. The preset does not add actor-side replay or MTP actions, and claims
+no convergence. Other PPO/GRPO/SP3O presets retain their existing behavior.
 
 ## Launch
 
@@ -112,15 +149,32 @@ export NUM_STEPS_PER_ROLLOUT=1
 export SUBTB_ALPHA=1.0 SUBTB_SAMPLING=window SUBTB_FLOW_INIT=zero
 export SUBTB_WINDOW_SIZE=64 SUBTB_NUM_WINDOWS=4
 export SUBTB_LENGTH_LAMBDA=1.0 SUBTB_FULL_WEIGHT=0.1
+# Two-timescale schedule: fit the flow first, then keep it ahead of the actor.
+export SUBTB_FLOW_WARMUP_STEPS=4 SUBTB_FLOW_INNER_STEPS=4
 export WANDB_MODE=online WANDB_PROJECT=SP3O-SubTB
 # Optional: export WANDB_ENTITY=your-team
 bash examples/sp3o/train_subtb.sh
 ```
 
-The preset forces zero critic-only warmup. Default batch: 64 prompts, 8
-responses each, a single 512-response optimizer update for each model.
-`--disable-weights-backuper` is incompatible: fixed reference weights must be
-preserved. Account for the extra host memory of actor/reference backups.
+`NUM_ROLLOUT` must exceed `SUBTB_FLOW_WARMUP_STEPS`; the leading warmup rounds
+take `K` flow steps each and the remaining rounds take one actor step plus `K`
+flow steps. The preset forces zero critic-only warmup. Default batch: 64
+prompts, 8 responses each, a single 512-response optimizer step for the actor
+per joint rollout. `--disable-weights-backuper` is incompatible: fixed reference
+weights must be preserved. Account for the extra host memory of
+actor/reference backups.
+
+Leave the rollout engine at its defaults. The upstream Qwen3-4B example passes
+neither `--sglang-max-running-requests` nor `--sglang-server-concurrency`: SGLang
+sizes the running-request cap from its own KV pool (here `min(pool_tokens/2,
+4096) = 4096`, with the pool being the real limit) and slime keeps its default
+client concurrency. Pinning the engine cap far below the offered concurrency
+(for example 16 running requests per engine while the client may hold hundreds
+in flight) starves throughput and, if the client concurrency is left at its
+default, backs requests up in the router until it answers HTTP 503
+`no_available_workers`. Cap a setting only with its partner: engine capacity and
+client concurrency have to move together, and any cap should be chosen from a
+measured sweep rather than from a worst-case token budget.
 
 Unit tests in `tests/test_subtb.py` check an analytically solved tree,
 coordinate equivalence, split versus joint gradients, terminal anchoring,

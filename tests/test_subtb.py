@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from slime.utils.subtb import subtb_loss, subtb_spans, validate_subtb_args, validate_subtb_sample, subtb_windows
+from slime.utils.subtb import subtb_flow_warmup_active
 
 NUM_GPUS = 0
 
@@ -75,7 +76,9 @@ def _args(**overrides):
                 enable_weights_backuper=True, compute_advantages_and_returns=True,
                 ref_update_interval=None, ref_load="fixed-reference",
                 actor_num_nodes=1, critic_num_nodes=1,
-                actor_num_gpus_per_node=2, critic_num_gpus_per_node=2)
+                actor_num_gpus_per_node=2, critic_num_gpus_per_node=2,
+                subtb_flow_inner_steps=1, subtb_flow_warmup_steps=0,
+                num_rollout=4, use_critic=True)
     args.update(overrides)
     return Namespace(**args)
 
@@ -90,10 +93,60 @@ def test_valid_configuration():
     dict(context_parallel_size=2), dict(hidden_dropout=.1),
     dict(enable_weights_backuper=False), dict(ref_update_interval=1),
     dict(num_critic_only_steps=1), dict(use_tis=True),
+    dict(subtb_flow_inner_steps=0), dict(subtb_flow_warmup_steps=-1),
+    dict(subtb_flow_warmup_steps=4), dict(subtb_flow_warmup_steps=2, use_critic=False),
 ])
 def test_unsupported_configs_fail_early(override):
     with pytest.raises(ValueError):
         validate_subtb_args(_args(**override))
+
+
+@pytest.mark.parametrize("warmup,num_rollout,expected", [
+    (0, 4, [False, False, False, False]),
+    (2, 4, [True, True, False, False]),
+    (4, 4, [True, True, True, True]),
+])
+def test_flow_warmup_rounds_are_prefix_only(warmup, num_rollout, expected):
+    args = _args(subtb_flow_warmup_steps=warmup, num_rollout=num_rollout)
+    assert [subtb_flow_warmup_active(args, i) for i in range(num_rollout)] == expected
+
+
+def test_flow_warmup_never_applies_to_other_presets():
+    for loss_type in ("policy_loss", "sft_loss", "custom_loss"):
+        args = _args(loss_type=loss_type, subtb_flow_warmup_steps=2)
+        assert not subtb_flow_warmup_active(args, 0)
+
+
+def _group(statuses, rewards):
+    class FakeSample:
+        def __init__(self, status, reward):
+            self.status = status
+            self.reward = reward
+
+        def get_reward_value(self, args):
+            return self.reward
+
+    from slime.utils.types import Sample
+
+    return [
+        FakeSample(getattr(Sample.Status, s), r)
+        for s, r in zip(statuses, rewards, strict=True)
+    ]
+
+
+def test_group_filter_drops_signal_free_groups():
+    from local.lumia.scripts.subtb_group_filter import subtb_group_filter
+
+    args = Namespace(reward_key="score")
+    # All responses hit the horizon: degenerate round, 3x rollout cost, no tilt.
+    assert not subtb_group_filter(args, _group(["TRUNCATED"] * 4, [0.0] * 4)).keep
+    assert subtb_group_filter(args, _group(["TRUNCATED"] * 4, [0.0] * 4)).reason == "all_truncated"
+    # Identical rewards carry no reward-driven signal either way.
+    assert subtb_group_filter(args, _group(["COMPLETED"] * 4, [0.0] * 4)).reason == "zero_std"
+    assert subtb_group_filter(args, _group(["COMPLETED"] * 4, [1.0] * 4)).reason == "zero_std"
+    # Mixed rewards are kept.
+    mixed = subtb_group_filter(args, _group(["COMPLETED"] * 4, [0.0, 1.0, 0.0, 1.0]))
+    assert mixed.keep and mixed.reason is None
 
 
 @pytest.mark.parametrize("status,length,last_token,valid", [

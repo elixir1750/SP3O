@@ -305,6 +305,8 @@ def train_one_step(
     optimizer: MegatronOptimizer,
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
+    inner_step: int = 0,
+    inner_steps: int = 1,
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -320,6 +322,11 @@ def train_one_step(
         optimizer (MegatronOptimizer): Optimizer instance.
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
         num_microbatches (int): Number of microbatches to process.
+        inner_step (int): Index of this optimizer step within the rollout. Only
+            SubTB's flow model uses values above zero, for the extra flow steps
+            that reuse the same actor snapshot.
+        inner_steps (int): Total optimizer steps taken for this rollout. It only
+            scales the reported step index; the data schedule is unchanged.
 
     Returns:
         tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
@@ -498,6 +505,8 @@ def train(
     opt_param_scheduler: OptimizerParamScheduler,
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
+    inner_step: int = 0,
+    inner_steps: int = 1,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -511,6 +520,11 @@ def train(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
         data_iterator (Sequence[DataIterator]): Iterable(s) yielding training batches.
         num_microbatches (Sequence[int]): Microbatches per step in the rollout.
+        inner_step (int): Index of this optimizer step within the rollout. Only
+            SubTB's flow model uses values above zero, for the extra flow steps
+            that reuse the same actor snapshot.
+        inner_steps (int): Total optimizer steps taken for this rollout. It only
+            scales the reported step index; the data schedule is unchanged.
     """
     args = get_args()
 
@@ -600,6 +614,8 @@ def train(
             optimizer,
             opt_param_scheduler,
             num_microbatches[step_id],
+            inner_step=inner_step,
+            inner_steps=inner_steps,
         )
 
         if step_id == 0:
@@ -638,7 +654,7 @@ def train(
             and mpu.get_tensor_model_parallel_rank() == 0
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
         ):
-            accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
+            accumulated_step_id = (rollout_id * num_steps_per_rollout + step_id) * inner_steps + inner_step
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
             log_dict = {

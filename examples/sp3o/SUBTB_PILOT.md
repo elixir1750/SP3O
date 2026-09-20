@@ -32,7 +32,10 @@ Request 8 GPUs on one node. The LUMIA capacity run passed with 8 RTX6000 Ada
 48GB GPUs, 64 CPUs and 640GB host RAM. This is a tested allocation, not a
 minimum requirement. Actor and flow each use TP4, PP1, CP1, sequence parallel,
 BF16, optimizer CPU offload and activation recomputation. SGLang engine TP is2.
-Actor LR is1e-6, flow LR4e-6, Adam betas(.9,.98), weight decay.1.
+Actor LR is1e-6, flow LR1e-4, Adam betas(.9,.98), weight decay.1. The schedule
+is two-timescale: the first `SUBTB_FLOW_WARMUP_STEPS` rollouts only fit the flow
+with the actor frozen, then every rollout takes one actor step and
+`SUBTB_FLOW_INNER_STEPS` flow steps.
 
 ```bash
 export HF_CHECKPOINT=/path/to/Qwen3-4B-Base
@@ -46,8 +49,9 @@ export EXPERIMENT_NAME=subtb-4B-pilot-seed1234
 export MODEL_SIZE=4B ACTOR_GPUS=4 TOTAL_GPUS=8 ROLLOUT_GPUS_PER_ENGINE=2
 export SEED=1234 SEQ_LENGTH=9216 MAX_RESPONSE_LEN=8192 MAX_TOKENS_PER_GPU=9216
 export ROLLOUT_BATCH_SIZE=64 N_SAMPLES_PER_PROMPT=8 OVER_SAMPLING_BATCH_SIZE=64
-export NUM_STEPS_PER_ROLLOUT=1 NUM_ROLLOUT=100 SAVE_INTERVAL=20 EVAL_INTERVAL=20
-export EVAL_MAX_RESPONSE_LEN=8192 CUDA_GRAPH_MAX_BATCH_SIZE=8 SGLANG_MEM_FRACTION_STATIC=0.65
+export SUBTB_FLOW_WARMUP_STEPS=4 SUBTB_FLOW_INNER_STEPS=4
+export NUM_STEPS_PER_ROLLOUT=1 NUM_ROLLOUT=104 SAVE_INTERVAL=20 EVAL_INTERVAL=20
+export EVAL_MAX_RESPONSE_LEN=8192 CUDA_GRAPH_MAX_BATCH_SIZE=256 SGLANG_MEM_FRACTION_STATIC=0.7
 export SUBTB_FLOW_INIT=zero SUBTB_SAMPLING=window SUBTB_ALPHA=1
 export SUBTB_WINDOW_SIZE=64 SUBTB_NUM_WINDOWS=4 SUBTB_LENGTH_LAMBDA=1 SUBTB_FULL_WEIGHT=0.1
 export WANDB_MODE=online WANDB_PROJECT=SP3O-SubTB USE_WANDB=1
@@ -55,12 +59,29 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # Use an existing W&B login. Select unused Ray ports if sharing a node.
 bash examples/sp3o/train_subtb.sh \
   --sglang-disable-cuda-graph --sglang-attention-backend triton \
-  --sglang-context-length 9216 --sglang-max-running-requests 16 \
-  --sglang-server-concurrency 16 \
+  --sglang-context-length 9216 \
   --rollout-max-prompt-len 1024 --rollout-top-p 1.0 --eval-top-p 1.0 \
   --n-samples-per-eval-prompt 4 \
   --save-debug-rollout-data "$OUTPUT_DIR/$EXPERIMENT_NAME/samples/{rollout_id}.pt"
 ```
+
+The upstream Qwen3-4B example passes neither an engine cap nor a client
+concurrency, which is unsafe at this geometry (512 responses per round, ~8k token
+tail): with no cap the client may hold 512 requests per engine, which drove the
+~390k token KV pool to 100% and killed a 100-round job with router 503s (job
+113811). The local launcher therefore pins both to the same value,
+`--sglang-max-running-requests 32 --sglang-server-concurrency 32`. The cap
+must be sized for the *worst* round, not the average: job 113925 hit a degenerate
+batch whose mean response length was 8002 of 8192, where 64 in-flight sequences
+already need ~512k tokens (34 real retractions). Measured throughput on normal
+rounds: cap16 142, cap32 216, cap64 235, cap96 249 tokens/gpu/s, all with zero
+503s, so 32 costs ~13% against 96 but keeps a 34% margin in the bad round.
+
+Signal-free groups are dropped before training
+(`--dynamic-sampling-filter-path local.lumia.scripts.subtb_group_filter`): every
+response truncated, or all rewards identical. The batch is refilled from the data
+source and the drop counts are logged as
+`rollout/dynamic_filter/drop_<reason>`; the held-out evaluation is unaffected.
 
 This launcher starts Ray by default. With an existing allocated Ray cluster,
 set START_RAY=0, RAY_ADDRESS and RAY_DASHBOARD_PORT appropriately. Do not

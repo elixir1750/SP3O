@@ -23,6 +23,7 @@ from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
+from slime.utils.subtb import subtb_flow_warmup_active
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
 
@@ -394,20 +395,31 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.loss_type not in ("subtb_loss", "subtb_flow_loss"):
             compute_advantages_and_returns(self.args, rollout_data)
             self.args.loss_type = "value_loss"
+            inner_steps = 1
         else:
             self.args.loss_type = "subtb_flow_loss"
-        train(
-            rollout_id,
-            self.model,
-            self.optimizer,
-            self.opt_param_scheduler,
-            data_iterator,
-            num_microbatches,
-        )
+            inner_steps = max(1, int(getattr(self.args, "subtb_flow_inner_steps", 1)))
+        # SubTB is a two-timescale scheme: the flow is the fast variable, so it may
+        # take several optimizer steps on the actor snapshot published by this
+        # rollout's sync. ``train`` resets the data iterators on entry, so every
+        # inner step walks the same micro-batch schedule (the actor's cached
+        # log-probs and rewards are constants for this rollout).
+        for inner_step in range(inner_steps):
+            train(
+                rollout_id,
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                data_iterator,
+                num_microbatches,
+                inner_step=inner_step,
+                inner_steps=inner_steps,
+            )
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        warmup_active = subtb_flow_warmup_active(self.args, rollout_id)
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
@@ -440,7 +452,14 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-                if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+                if warmup_active:
+                    # The actor is frozen, so pi == p_ref exactly and the current
+                    # log-probs are the reference ones just computed. Reusing them
+                    # skips a full forward pass and keeps the snapshot the flow sees
+                    # consistent with the frozen actor.
+                    rollout_data["log_probs"] = list(rollout_data["ref_log_probs"])
+                    logger.info("SubTB flow warmup round %s: reused reference log-probs", rollout_id)
+                elif not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
@@ -482,15 +501,24 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
-            with timer("actor_train"):
-                train(
+            if warmup_active:
+                # Flow-only warmup: the forwards above already published this
+                # rollout's log-probs / reference log-probs, but the actor must not
+                # move before the flow can act as its baseline.
+                logger.info(
+                    "SubTB flow warmup round %s: actor optimizer step skipped",
                     rollout_id,
-                    self.model,
-                    self.optimizer,
-                    self.opt_param_scheduler,
-                    data_iterator,
-                    num_microbatches,
                 )
+            else:
+                with timer("actor_train"):
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                    )
 
             self.prof.step(rollout_id=rollout_id)
 
