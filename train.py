@@ -1,11 +1,20 @@
+import logging
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, update_tracking_open_metrics
 from slime.utils.misc import should_run_periodic_action
-from slime.utils.subtb import add_subtb_arguments, subtb_flow_warmup_active, validate_subtb_args
+from slime.utils.subtb import (
+    add_subtb_arguments,
+    subtb_flow_warmup_active,
+    subtb_warmup_should_stop,
+    validate_subtb_args,
+)
 from slime.utils.sp3o import add_sp3o_arguments, validate_sp3o_args
+
+logger = logging.getLogger(__name__)
 
 
 def train(args):
@@ -72,6 +81,7 @@ def train(args):
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
+    warmup_gap_history: list[float] = []
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # SubTB may ramp in with flow-only warmup rounds. The actor process is still
         # started (it must publish log-probs and reference log-probs for the flow) but
@@ -86,13 +96,36 @@ def train(args):
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
 
+        actor_signals = None
         if args.use_critic:
             critic_train_handle = critic_model.async_train(rollout_id, rollout_data_ref)
             if rollout_id >= args.num_critic_only_steps and not args.critic_train_only:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+                actor_signals = ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
             ray.get(critic_train_handle)
         else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+            actor_signals = ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+
+        # Adaptive SubTB warmup: once the flow's root prediction sits within the
+        # requested gap of log Z(q) for consecutive rounds, start the joint phase
+        # early. --subtb-flow-warmup-steps stays the upper bound.
+        if warmup and actor_signals and args.subtb_flow_warmup_target_gap is not None:
+            gaps = [s["gap"] for s in actor_signals if isinstance(s, dict) and s.get("gap") is not None]
+            if gaps:
+                mean_gap = sum(gaps) / len(gaps)
+                warmup_gap_history.append(mean_gap)
+                if subtb_warmup_should_stop(
+                    warmup_gap_history,
+                    min_steps=args.subtb_flow_warmup_min_steps,
+                    target_gap=args.subtb_flow_warmup_target_gap,
+                    rollout_id=rollout_id,
+                ):
+                    args.subtb_flow_warmup_steps = rollout_id + 1
+                    actor_model.set_subtb_warmup_steps(rollout_id + 1)
+                    logger.info(
+                        "SubTB warmup converged (mean root gap %.4f): joint phase starts at rollout %d",
+                        mean_gap,
+                        rollout_id + 1,
+                    )
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             save(rollout_id)

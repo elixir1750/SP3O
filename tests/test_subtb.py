@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from slime.utils.subtb import subtb_loss, subtb_spans, validate_subtb_args, validate_subtb_sample, subtb_windows
-from slime.utils.subtb import subtb_flow_warmup_active
+from slime.utils.subtb import subtb_flow_warmup_active, subtb_warmup_should_stop
 
 NUM_GPUS = 0
 
@@ -78,6 +78,7 @@ def _args(**overrides):
                 actor_num_nodes=1, critic_num_nodes=1,
                 actor_num_gpus_per_node=2, critic_num_gpus_per_node=2,
                 subtb_flow_inner_steps=1, subtb_flow_warmup_steps=0,
+                subtb_flow_warmup_target_gap=None, subtb_flow_warmup_min_steps=2,
                 num_rollout=4, use_critic=True)
     args.update(overrides)
     return Namespace(**args)
@@ -95,6 +96,11 @@ def test_valid_configuration():
     dict(num_critic_only_steps=1), dict(use_tis=True),
     dict(subtb_flow_inner_steps=0), dict(subtb_flow_warmup_steps=-1),
     dict(subtb_flow_warmup_steps=4), dict(subtb_flow_warmup_steps=2, use_critic=False),
+    dict(subtb_flow_warmup_target_gap=0.0, subtb_flow_warmup_steps=2),
+    dict(subtb_flow_warmup_target_gap=float("nan"), subtb_flow_warmup_steps=2),
+    dict(subtb_flow_warmup_target_gap=0.05, subtb_flow_warmup_steps=0),
+    dict(subtb_flow_warmup_target_gap=0.05, subtb_flow_warmup_steps=2, subtb_flow_warmup_min_steps=0),
+    dict(subtb_flow_warmup_target_gap=0.05, subtb_flow_warmup_steps=2, subtb_flow_warmup_min_steps=3),
 ])
 def test_unsupported_configs_fail_early(override):
     with pytest.raises(ValueError):
@@ -115,6 +121,29 @@ def test_flow_warmup_never_applies_to_other_presets():
     for loss_type in ("policy_loss", "sft_loss", "custom_loss"):
         args = _args(loss_type=loss_type, subtb_flow_warmup_steps=2)
         assert not subtb_flow_warmup_active(args, 0)
+
+
+def test_adaptive_warmup_needs_two_consecutive_converged_rounds():
+    # A single lucky round must not end the warmup.
+    assert not subtb_warmup_should_stop([0.04], min_steps=2, target_gap=0.05, rollout_id=0)
+    assert subtb_warmup_should_stop([0.04, 0.03], min_steps=2, target_gap=0.05, rollout_id=1)
+    # The second-to-last round was still far away.
+    assert not subtb_warmup_should_stop([0.30, 0.03], min_steps=2, target_gap=0.05, rollout_id=1)
+    # min_steps is respected even when the flow converged immediately.
+    assert not subtb_warmup_should_stop([0.01, 0.01], min_steps=4, target_gap=0.05, rollout_id=1)
+    assert subtb_warmup_should_stop([0.01, 0.01, 0.01, 0.01], min_steps=4, target_gap=0.05, rollout_id=3)
+    # Feature disabled.
+    assert not subtb_warmup_should_stop([0.0, 0.0], min_steps=2, target_gap=None, rollout_id=5)
+
+
+def test_adaptive_warmup_is_opt_in_and_bounded():
+    # Without a target gap the schedule stays fixed, and the fixed bound is valid.
+    validate_subtb_args(_args(num_rollout=8, subtb_flow_warmup_steps=6,
+                              subtb_flow_warmup_target_gap=0.05))
+    validate_subtb_args(_args(num_rollout=8, subtb_flow_warmup_steps=6, subtb_flow_warmup_min_steps=6,
+                             subtb_flow_warmup_target_gap=0.05))
+    # The adaptive bound never exceeds the fixed warmup budget.
+    validate_subtb_args(_args(subtb_flow_warmup_steps=0, subtb_flow_warmup_min_steps=2))
 
 
 def _group(statuses, rewards):

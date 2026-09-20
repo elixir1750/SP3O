@@ -42,6 +42,23 @@ def add_subtb_arguments(parser):
             "step and its weights are not re-synchronised to the rollout engines."
         ),
     )
+    parser.add_argument(
+        "--subtb-flow-warmup-target-gap",
+        type=float,
+        default=None,
+        help=(
+            "Optional adaptive warmup: end the warmup early once the root flow is "
+            "within this absolute distance of log Z(q) for two consecutive rounds. "
+            "Disabled (None) keeps the fixed --subtb-flow-warmup-steps schedule, "
+            "which remains the upper bound."
+        ),
+    )
+    parser.add_argument(
+        "--subtb-flow-warmup-min-steps",
+        type=int,
+        default=2,
+        help="Minimum number of warmup rounds before the adaptive criterion may fire.",
+    )
     return parser
 
 
@@ -87,6 +104,15 @@ def validate_subtb_args(args):
             raise ValueError("SubTB flow warmup requires the flow model (critic role)")
         if getattr(args, "num_rollout", 0) <= args.subtb_flow_warmup_steps:
             raise ValueError("SubTB flow warmup must leave at least one joint rollout")
+    if args.subtb_flow_warmup_target_gap is not None:
+        if not math.isfinite(args.subtb_flow_warmup_target_gap) or args.subtb_flow_warmup_target_gap <= 0:
+            raise ValueError("SubTB adaptive warmup target gap must be finite and positive")
+        if args.subtb_flow_warmup_steps <= 0:
+            raise ValueError("SubTB adaptive warmup needs --subtb-flow-warmup-steps as its upper bound")
+    if args.subtb_flow_warmup_min_steps < 1:
+        raise ValueError("SubTB adaptive warmup minimum steps must be positive")
+    if args.subtb_flow_warmup_steps > 0 and args.subtb_flow_warmup_min_steps > args.subtb_flow_warmup_steps:
+        raise ValueError("SubTB adaptive warmup minimum steps cannot exceed the warmup bound")
 
 
 def subtb_flow_warmup_active(args, rollout_id: int) -> bool:
@@ -100,6 +126,22 @@ def subtb_flow_warmup_active(args, rollout_id: int) -> bool:
         return False
     warmup_steps = getattr(args, "subtb_flow_warmup_steps", 0) or 0
     return warmup_steps > 0 and rollout_id < warmup_steps
+
+
+def subtb_warmup_should_stop(gap_history, *, min_steps: int, target_gap: float, rollout_id: int) -> bool:
+    """Adaptive warmup criterion: the flow has converged on the tilted target.
+
+    ``gap_history`` holds one mean(g(s0) - log Z(q)) per completed warmup round.
+    The warmup ends when the last two rounds are both within ``target_gap`` and at
+    least ``min_steps`` rounds have been observed, so a single lucky round cannot
+    trigger the switch. Both quantities come from the round's own reward rate, so
+    the comparison stays valid while the prompt mix changes between rounds.
+    """
+    if target_gap is None or target_gap <= 0:
+        return False
+    if len(gap_history) < min_steps or rollout_id + 1 < min_steps:
+        return False
+    return all(abs(gap) <= target_gap for gap in list(gap_history)[-2:])
 
 
 def validate_subtb_sample(sample, eos_id, horizon):

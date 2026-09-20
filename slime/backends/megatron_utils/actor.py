@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import random
 import socket
@@ -420,6 +421,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         warmup_active = subtb_flow_warmup_active(self.args, rollout_id)
+        warmup_signal = None
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
@@ -522,10 +524,30 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.prof.step(rollout_id=rollout_id)
 
+        if warmup_active and getattr(self.args, "subtb_flow_warmup_target_gap", None) is not None:
+            # Adaptive warmup: report how far the flow's root prediction is from
+            # log Z(q) = log E[e^{r/alpha}] for this round, so the driver can end the
+            # warmup as soon as the flow has converged instead of running a fixed W.
+            values = rollout_data.get("values")
+            rewards = rollout_data.get("rewards")
+            if values and rewards:
+                root = float(torch.stack([value.flatten()[0] for value in values]).mean())
+                reward_rate = float(sum(rewards) / len(rewards))
+                gap = None
+                if 0 <= reward_rate < 1:
+                    gap = root - math.log(1 - reward_rate + reward_rate * math.e)
+                warmup_signal = {"root": root, "reward_rate": reward_rate, "gap": gap}
+
         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()
+
+        return warmup_signal
+
+    def set_subtb_warmup_steps(self, steps: int) -> None:
+        """Shorten the warmup from the driver once the adaptive criterion fires."""
+        self.args.subtb_flow_warmup_steps = int(steps)
 
         # update the cpu actor weight to the latest model
         self.weights_backuper.backup("actor")

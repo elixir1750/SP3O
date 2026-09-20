@@ -30,12 +30,14 @@ a manifest and the excluded conflicting-label groups. The source is unchanged.
 
 Request 8 GPUs on one node. The LUMIA capacity run passed with 8 RTX6000 Ada
 48GB GPUs, 64 CPUs and 640GB host RAM. This is a tested allocation, not a
-minimum requirement. Actor and flow each use TP4, PP1, CP1, sequence parallel,
-BF16, optimizer CPU offload and activation recomputation. SGLang engine TP is2.
-Actor LR is1e-6, flow LR1e-4, Adam betas(.9,.98), weight decay.1. The schedule
-is two-timescale: the first `SUBTB_FLOW_WARMUP_STEPS` rollouts only fit the flow
-with the actor frozen, then every rollout takes one actor step and
-`SUBTB_FLOW_INNER_STEPS` flow steps.
+minimum requirement. Actor and flow each use TP2 (tensor parallelism 2, as in the
+upstream example) with DP2, PP1, CP1, sequence parallel, BF16, optimizer CPU
+offload and activation recomputation. SGLang engine TP is2. Actor LR is1e-6, flow
+LR3e-5, Adam betas(.9,.98), weight decay.1. The schedule is two-timescale: the
+first `SUBTB_FLOW_WARMUP_STEPS` rollouts only fit the flow with the actor frozen,
+then every rollout takes one actor step and `SUBTB_FLOW_INNER_STEPS` flow steps.
+TP2 x DP2 measured 47s per flow step against 10.8 min at TP4 x DP1 (job 113925),
+because the TP4/DP1 layout was activation-memory bound rather than FLOP bound.
 
 ```bash
 export HF_CHECKPOINT=/path/to/Qwen3-4B-Base
@@ -49,8 +51,10 @@ export EXPERIMENT_NAME=subtb-4B-pilot-seed1234
 export MODEL_SIZE=4B ACTOR_GPUS=4 TOTAL_GPUS=8 ROLLOUT_GPUS_PER_ENGINE=2
 export SEED=1234 SEQ_LENGTH=9216 MAX_RESPONSE_LEN=8192 MAX_TOKENS_PER_GPU=9216
 export ROLLOUT_BATCH_SIZE=64 N_SAMPLES_PER_PROMPT=8 OVER_SAMPLING_BATCH_SIZE=64
-export SUBTB_FLOW_WARMUP_STEPS=4 SUBTB_FLOW_INNER_STEPS=4
-export NUM_STEPS_PER_ROLLOUT=1 NUM_ROLLOUT=104 SAVE_INTERVAL=20 EVAL_INTERVAL=20
+export SUBTB_FLOW_WARMUP_STEPS=12 SUBTB_FLOW_INNER_STEPS=2
+export SUBTB_FLOW_WARMUP_TARGET_GAP=0.05 SUBTB_FLOW_WARMUP_MIN_STEPS=4
+export CRITIC_LR=3e-5 TP_SIZE=2
+export NUM_STEPS_PER_ROLLOUT=1 NUM_ROLLOUT=112 SAVE_INTERVAL=20 EVAL_INTERVAL=20
 export EVAL_MAX_RESPONSE_LEN=8192 CUDA_GRAPH_MAX_BATCH_SIZE=256 SGLANG_MEM_FRACTION_STATIC=0.7
 export SUBTB_FLOW_INIT=zero SUBTB_SAMPLING=window SUBTB_ALPHA=1
 export SUBTB_WINDOW_SIZE=64 SUBTB_NUM_WINDOWS=4 SUBTB_LENGTH_LAMBDA=1 SUBTB_FULL_WEIGHT=0.1

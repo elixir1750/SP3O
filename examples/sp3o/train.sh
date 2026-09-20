@@ -127,6 +127,10 @@ if [[ "$PRESET" == subtb ]]; then
            --subtb-num-windows "${SUBTB_NUM_WINDOWS:-4}"
            --subtb-length-lambda "${SUBTB_LENGTH_LAMBDA:-1.0}"
            --subtb-full-weight "${SUBTB_FULL_WEIGHT:-0.1}")
+    if [[ -n "${SUBTB_FLOW_WARMUP_TARGET_GAP:-}" && "${SUBTB_FLOW_WARMUP_TARGET_GAP}" != none ]]; then
+        ARGS+=(--subtb-flow-warmup-target-gap "${SUBTB_FLOW_WARMUP_TARGET_GAP}"
+               --subtb-flow-warmup-min-steps "${SUBTB_FLOW_WARMUP_MIN_STEPS:-2}")
+    fi
 else
     ARGS+=(--partial-rollout --use-tis)
 fi

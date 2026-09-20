@@ -131,6 +131,15 @@ prompt distribution towards questions with mixed outcomes, so it must be
 reported with the results; the held-out evaluation set is untouched and stays
 the unbiased measurement.
 
+`--subtb-flow-warmup-target-gap` turns the fixed warmup into a convergence test:
+each warmup round reports `mean(g(s0)) - log Z(q)` (both terms computed from that
+round's own reward rate, so the comparison stays valid while the prompt mix
+changes), and the joint phase starts as soon as two consecutive rounds are within
+the requested gap, after at least `--subtb-flow-warmup-min-steps` rounds.
+`--subtb-flow-warmup-steps` remains the upper bound. Replaying job 113925's two
+warmup rounds (gaps -0.2325, +0.1353) keeps warming up, i.e. the criterion agrees
+that two rounds were not enough.
+
 The first implementation enforces one global batch per rollout, matching
 actor/flow topology, Megatron, CP=PP=1, temperature 1, zero dropout, complete
 unmasked responses, and a fixed reference. Partial rollout, PPO TIS and moving
