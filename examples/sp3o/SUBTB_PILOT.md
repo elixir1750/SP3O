@@ -56,6 +56,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 bash examples/sp3o/train_subtb.sh \
   --sglang-disable-cuda-graph --sglang-attention-backend triton \
   --sglang-context-length 9216 --sglang-max-running-requests 16 \
+  --sglang-server-concurrency 16 \
   --rollout-max-prompt-len 1024 --rollout-top-p 1.0 --eval-top-p 1.0 \
   --n-samples-per-eval-prompt 4 \
   --save-debug-rollout-data "$OUTPUT_DIR/$EXPERIMENT_NAME/samples/{rollout_id}.pt"
@@ -79,7 +80,12 @@ unpatched arbitrary upstream versions. CUDA extensions must match the new GPU.
 75 SubTB/SP3O/critic-head tests passed on CPU (job113634). TP2 short execution
 passed (113635). TP4 capacity (113639) passed three512-response joint updates,
 real positive rewards,8192-token horizon coverage, evaluations and checkpoints.
-The 100-round job113640 was submitted; no final efficacy result is claimed.
+The first 100-round job113640 failed during initial evaluation with router503
+errors before any training update. Client concurrency was512 per engine despite
+an engine running-request limit of16. The launch above now bounds client
+concurrency to16 to avoid flooding the router. Retry113758 was submitted after
+CPU argument preflight113757 passed; the retry is not yet validated end-to-end.
+No final efficacy result is claimed.
 
 Primary metric is eval/dapo_pilot (average correctness, not pass@4).
 rollout/raw_reward tracks training correctness; rollout/values is mean g,
