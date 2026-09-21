@@ -89,6 +89,11 @@ def create_placement_groups(args):
     elif args.debug_rollout_only:
         num_gpus = args.rollout_num_gpus
         rollout_offset = 0
+        # No training model is initialised in this mode (see
+        # MegatronTrainRayActor.init), so the critic shares the rollout bundles.
+        # Without this the `if args.use_critic` block below would reference an
+        # unbound name for SubTB, which always uses a critic.
+        critic_offset = 0
     elif args.colocate:
         num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
         rollout_offset = 0

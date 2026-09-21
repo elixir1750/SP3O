@@ -74,7 +74,11 @@ ARGS=(
     --input-key "${INPUT_KEY:-prompt}"
     --label-key "${LABEL_KEY:-label}"
     --apply-chat-template
-    --rollout-shuffle
+)
+if [[ "${ROLLOUT_SHUFFLE:-1}" == 1 ]]; then
+    ARGS+=(--rollout-shuffle)
+fi
+ARGS+=(
     --rm-type sp3o_math
     --reward-key score
     --num-rollout "${NUM_ROLLOUT}"

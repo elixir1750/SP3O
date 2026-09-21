@@ -81,11 +81,15 @@ already need ~512k tokens (34 real retractions). Measured throughput on normal
 rounds: cap16 142, cap32 216, cap64 235, cap96 249 tokens/gpu/s, all with zero
 503s, so 32 costs ~13% against 96 but keeps a 34% margin in the bad round.
 
-Signal-free groups are dropped before training
-(`--dynamic-sampling-filter-path local.lumia.scripts.subtb_group_filter`): every
-response truncated, or all rewards identical. The batch is refilled from the data
-source and the drop counts are logged as
-`rollout/dynamic_filter/drop_<reason>`; the held-out evaluation is unaffected.
+Degenerate groups are dropped before training
+(`--dynamic-sampling-filter-path slime.utils.subtb_filter.subtb_group_filter`): every
+response truncated, or no response parsable. Dumps show 0% of groups are dropped
+in normal rounds and 100% in a degenerate one, so the rule is free when the policy
+behaves and protective when it does not; a bounded drop budget keeps a bad region
+from starving the rollout. Dropping zero-variance groups instead would cost ~50%
+extra rollout in every round and is off by default (`SUBTB_FILTER_ZERO_STD=1`).
+Drop counts are logged as `rollout/dynamic_filter/drop_<reason>`; the held-out
+evaluation is unaffected.
 
 This launcher starts Ray by default. With an existing allocated Ray cluster,
 set START_RAY=0, RAY_ADDRESS and RAY_DASHBOARD_PORT appropriately. Do not
@@ -94,6 +98,29 @@ For a capacity run use NUM_ROLLOUT=3, SAVE_INTERVAL=3, EVAL_INTERVAL=3 and
 capacity.yaml; restart the efficacy run from base weights after it passes.
 
 ## Environment and evidence
+
+## Effect run: the configuration we actually submit
+
+The 100-joint-round run is submitted as the `effect` stage of the local launcher,
+which refuses to start unless the capacity/smoke run it points at contains a
+`VALIDATED` marker. Its settings, as verified in the smoke:
+
+| Item | Value |
+| --- | --- |
+| Resources | 1 node x 8 GPU (L40S or ADA6000), 64 CPU, 900 GB host RAM, 3-day limit |
+| Data | curated warmup prefix (768 mixed-outcome prompts) followed by the 16,151 remaining DAPO train rows, `ROLLOUT_SHUFFLE=0` so the warmup consumes the prefix in order; evaluation on the fixed 256 held-out questions x 4 |
+| Rollout | 64 prompts x 8 responses = 512 per round, 1x over-sampling, temperature 1.0, top-p 1.0, context 9216 (prompt <= 1024, response <= 8192) |
+| Engines | 4 x SGLang TP2, `max_running_requests` = client concurrency = 32, mem-fraction 0.7, CUDA graphs disabled, triton attention |
+| Training topology | actor TP2 x DP2 (4 GPUs) + flow/critic TP2 x DP2 (4 GPUs), BF16, sequence parallel, recompute 1 layer, optimizer CPU offload |
+| Optimizer | Adam (0.9, 0.98), weight decay 0.1, constant LR: actor 1e-6, flow 3e-5 |
+| Per round | actor exactly 1 optimizer step, flow K = 2 steps on the same cached snapshot |
+| Objective | NTP SubTB, alpha 1, zero-initialised flow head, 4 random 64-action windows + mandatory terminal window, lambda 1, full-path weight 0.1, no PPO clipping/GAE/TIS/partial rollout |
+| Two-timescale | warmup <= 12 rounds with the actor frozen (adaptive stop: |mean(g(s0)) - log Z(q)| <= 0.05 for two consecutive rounds, at least 4); joint rounds >= 100, since unused warmup rounds become extra joint rounds |
+| Data hygiene | drop degenerate groups (all 8 truncated, or all 8 unparseable) with a bounded refill budget; forced accepts are logged as "group filter saturated" |
+| Evidence | W&B online, metrics per round, checkpoints every 20 joint rounds, evaluation every 20 rounds, per-round sample dumps, gate writes `pilot-evidence.json` + `VALIDATED` |
+
+Totals for the run: 112 rollouts (12 warmup bound + 100 joint), 224 flow steps,
+at least 100 actor updates, estimated 15-22 hours on one 8-GPU node.
 
 The validated environment uses Python3.12, torch2.9.1+cu128,
 transformers4.57.1, numpy1.26.4, Transformer Engine2.10 and FlashAttention2.7.4.post1.

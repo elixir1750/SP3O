@@ -56,6 +56,12 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> int | None:
         if args.debug_rollout_only:
             self.args = args
+            # Keep the attributes the rest of the actor interface reads: this mode
+            # skips model construction, but connect_actor_critic still consults
+            # self.role and the save/offload calls consult self.args.
+            self.role = role
+            self.with_ref = with_ref
+            self.with_opd_teacher = with_opd_teacher
             return 0
 
         monkey_patch_torch_dist()
@@ -683,6 +689,9 @@ class MegatronTrainRayActor(TrainRayActor):
         master_address: str | None = None,
         master_port: int | None = None,
     ) -> None:
+        if self.args.debug_rollout_only:
+            # No training model exists, so there is no actor/flow state to sync.
+            return
         if self.role == "actor":
             master_address = ray.util.get_node_ip_address()
             with socket.socket() as sock:

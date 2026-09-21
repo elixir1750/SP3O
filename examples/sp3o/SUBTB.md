@@ -118,18 +118,25 @@ reports `g(s0)`, so warmup is judged against `log(1 - p + p e)` for the observed
 reward rate `p` (about 0.22 at p ~ 0.14), not against the loss level, which is
 already near its reward-variance floor before the flow is fitted.
 
-Signal-free groups are dropped before they reach the objective
-(`--dynamic-sampling-filter-path local.lumia.scripts.subtb_group_filter`). A
-group is discarded when every response is TRUNCATED, or when all of its rewards
-are identical: the tilted target `p_ref exp(r/alpha)/Z` gives such a group no
-reward-driven direction, and in the fully truncated case the round also costs
-about 3x the rollout time (measured 765s versus 250s for a normal round in job
-113925). The data source refills the batch, so the trained batch is still
-`rollout_batch_size x n_samples_per_prompt`; drop counts are logged as
-`rollout/dynamic_filter/drop_<reason>`. This deliberately shifts the *training*
-prompt distribution towards questions with mixed outcomes, so it must be
-reported with the results; the held-out evaluation set is untouched and stays
-the unbiased measurement.
+Degenerate groups are dropped before they reach the objective
+(`--dynamic-sampling-filter-path slime.utils.subtb_filter.subtb_group_filter`): a
+group is discarded when every response is TRUNCATED or when no response yields a
+parsable answer. Measured over the dumped rounds, normal rounds contain 0%
+all-truncated and 0% all-unparseable groups, while a degenerate round (mean
+response 8002 of 8192) had 66-69% all-truncated and 100% all-unparseable, so this
+rule costs nothing in normal rounds and removes exactly the rows that burn the
+most rollout compute without carrying an answer. The data source refills the
+batch, and a bounded drop budget (one batch worth of drops, one credit refunded
+per accepted group, forced accepts logged as "group filter saturated") keeps a
+uniformly bad region from starving the rollout.
+
+An earlier revision also dropped groups whose rewards were all identical. The
+dumps show that rule fires on 41-59% of the groups in *every* normal round, which
+doubles rollout cost per round for roughly the same signal per GPU-hour, and it
+removes both all-wrong-but-parseable groups (whose tilted target is legitimately
+p_ref, so they still carry a stabilising gradient) and all-correct groups (a real
+tilt signal). It is therefore off by default and reachable only through
+`SUBTB_FILTER_ZERO_STD=1` for A/B work.
 
 `--subtb-flow-warmup-target-gap` turns the fixed warmup into a convergence test:
 each warmup round reports `mean(g(s0)) - log Z(q)` (both terms computed from that

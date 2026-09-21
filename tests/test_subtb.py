@@ -146,36 +146,61 @@ def test_adaptive_warmup_is_opt_in_and_bounded():
     validate_subtb_args(_args(subtb_flow_warmup_steps=0, subtb_flow_warmup_min_steps=2))
 
 
-def _group(statuses, rewards):
+def _group(statuses, rewards, predictions=None):
     class FakeSample:
-        def __init__(self, status, reward):
+        def __init__(self, status, reward, prediction):
             self.status = status
-            self.reward = reward
+            self.reward = {"score": reward, "extracted_pred": [prediction]}
 
         def get_reward_value(self, args):
-            return self.reward
+            return self.reward["score"]
 
     from slime.utils.types import Sample
 
+    if predictions is None:
+        predictions = ["42"] * len(statuses)
     return [
-        FakeSample(getattr(Sample.Status, s), r)
-        for s, r in zip(statuses, rewards, strict=True)
+        FakeSample(getattr(Sample.Status, s), r, p)
+        for s, r, p in zip(statuses, rewards, predictions, strict=True)
     ]
 
 
 def test_group_filter_drops_signal_free_groups():
-    from local.lumia.scripts.subtb_group_filter import subtb_group_filter
+    from slime.utils import subtb_filter as module
 
-    args = Namespace(reward_key="score")
-    # All responses hit the horizon: degenerate round, 3x rollout cost, no tilt.
+    module._state.update(budget=None, forced=0)
+    subtb_group_filter = module.subtb_group_filter
+
+    args = Namespace(reward_key="score", rollout_batch_size=6)
+    # Every response hit the horizon: degenerate, 3x rollout cost, no answer.
     assert not subtb_group_filter(args, _group(["TRUNCATED"] * 4, [0.0] * 4)).keep
     assert subtb_group_filter(args, _group(["TRUNCATED"] * 4, [0.0] * 4)).reason == "all_truncated"
-    # Identical rewards carry no reward-driven signal either way.
-    assert subtb_group_filter(args, _group(["COMPLETED"] * 4, [0.0] * 4)).reason == "zero_std"
-    assert subtb_group_filter(args, _group(["COMPLETED"] * 4, [1.0] * 4)).reason == "zero_std"
-    # Mixed rewards are kept.
+    # No answer could be extracted from any response: degenerate too.
+    unparseable = subtb_group_filter(args, _group(["COMPLETED"] * 4, [0.0] * 4, [""] * 4))
+    assert not unparseable.keep and unparseable.reason == "all_unparseable"
+    # All-wrong but parseable groups are deliberately KEPT: their tilted target is
+    # p_ref, so they still carry a stabilising gradient, and dropping them costs a
+    # ~50% refill in every normal round.
+    assert subtb_group_filter(args, _group(["COMPLETED"] * 4, [0.0] * 4)).keep
+    assert subtb_group_filter(args, _group(["COMPLETED"] * 4, [1.0] * 4)).keep
+    # Mixed rewards are kept, and every accepted group refunds one drop credit.
     mixed = subtb_group_filter(args, _group(["COMPLETED"] * 4, [0.0, 1.0, 0.0, 1.0]))
     assert mixed.keep and mixed.reason is None
+    # Exhaust the budget on degenerate groups, then accept instead of dropping so a
+    # uniformly bad region cannot starve the rollout.
+    for _ in range(6):
+        assert not subtb_group_filter(args, _group(["COMPLETED"] * 4, [0.0] * 4, [""] * 4)).keep
+    forced = subtb_group_filter(args, _group(["COMPLETED"] * 4, [0.0] * 4, [""] * 4))
+    assert forced.keep and forced.reason is None
+    assert module._state["forced"] == 1
+    # With the refund the filter can drop again.
+    assert not subtb_group_filter(args, _group(["TRUNCATED"] * 4, [0.0] * 4)).keep
+    # The zero-variance rule stays available for A/B, off by default.
+    module._DROP_ZERO_STD = True
+    module._state.update(budget=10, forced=0)
+    assert subtb_group_filter(args, _group(["COMPLETED"] * 4, [0.0] * 4)).reason == "zero_std"
+    module._DROP_ZERO_STD = False
+    module._state.update(budget=None, forced=0)
 
 
 @pytest.mark.parametrize("status,length,last_token,valid", [

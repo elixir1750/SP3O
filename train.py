@@ -119,12 +119,18 @@ def train(args):
                     target_gap=args.subtb_flow_warmup_target_gap,
                     rollout_id=rollout_id,
                 ):
+                    # The run is sized as (warmup bound + planned joint rounds), so
+                    # ending the warmup early already turns the unused warmup rounds
+                    # into extra joint rounds: the planned joint budget is a floor.
+                    saved = max(0, args.subtb_flow_warmup_steps - (rollout_id + 1))
                     args.subtb_flow_warmup_steps = rollout_id + 1
                     actor_model.set_subtb_warmup_steps(rollout_id + 1)
                     logger.info(
-                        "SubTB warmup converged (mean root gap %.4f): joint phase starts at rollout %d",
+                        "SubTB warmup converged (mean root gap %.4f): joint phase starts at rollout %d "
+                        "(%d warmup rounds saved become joint rounds)",
                         mean_gap,
                         rollout_id + 1,
+                        saved,
                     )
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
