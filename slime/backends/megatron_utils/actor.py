@@ -24,7 +24,7 @@ from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
-from slime.utils.subtb import subtb_flow_warmup_active
+from slime.utils.subtb import mean_engine_logprob_gap, subtb_flow_warmup_active
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
 
@@ -530,32 +530,55 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.prof.step(rollout_id=rollout_id)
 
-        if warmup_active and getattr(self.args, "subtb_flow_warmup_target_gap", None) is not None:
-            # Adaptive warmup: report how far the flow's root prediction is from
-            # log Z(q) = log E[e^{r/alpha}] for this round, so the driver can end the
-            # warmup as soon as the flow has converged instead of running a fixed W.
+        if warmup_active:
+            # Warmup diagnostics, deliberately not a convergence gate. With the actor
+            # frozen at p_ref every log-ratio term vanishes, so the flow's own
+            # least-squares fixed point is g(s) -> E[r/alpha | s]: the root lands on
+            # the mean reward, not on log Z(q) = log E_p_ref[e^{r/alpha}], which is the
+            # fixed point of the *joint* solution. Comparing the root against log Z
+            # therefore measures the joint gap and can never certify warmup
+            # convergence (two outcomes, rewards 0/1, alpha 1: the frozen-actor
+            # optimum is 0.5 while log Z = 0.6201). Report both so the two scales are
+            # visible in the logs.
             values = rollout_data.get("values")
             rewards = rollout_data.get("rewards")
             if values and rewards:
                 root = float(torch.stack([value.flatten()[0] for value in values]).mean())
                 reward_rate = float(sum(rewards) / len(rewards))
-                gap = None
+                log_z_joint = None
                 if 0 <= reward_rate < 1:
-                    gap = root - math.log(1 - reward_rate + reward_rate * math.e)
-                warmup_signal = {"root": root, "reward_rate": reward_rate, "gap": gap}
+                    log_z_joint = math.log(1 - reward_rate + reward_rate * math.e)
+                warmup_signal = {
+                    "root": root,
+                    "reward_rate": reward_rate,
+                    "mean_reward_target": reward_rate,
+                    "log_z_joint_target": log_z_joint,
+                }
+
+        # Publish the engine-vs-actor log-prob gap so the driver can refuse to train on
+        # rollouts that were not produced by the actor's current weights. It is free:
+        # both tensors are already in this rollout's data.
+        engine_gap = mean_engine_logprob_gap(
+            rollout_data.get("rollout_log_probs"),
+            rollout_data.get("log_probs"),
+            rollout_data.get("loss_masks"),
+        )
+        signal = warmup_signal if warmup_signal is not None else {}
+        signal["engine_gap"] = engine_gap
+        warmup_signal = signal
 
         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()
 
-        return warmup_signal
-
-    def set_subtb_warmup_steps(self, steps: int) -> None:
-        """Shorten the warmup from the driver once the adaptive criterion fires."""
-        self.args.subtb_flow_warmup_steps = int(steps)
-
         # update the cpu actor weight to the latest model
+        # This is not optional: the next round restores from this backup when it
+        # switches back from "ref" to "actor" (_switch_model -> restore), and
+        # update_weights reads the same backup to fill the rollout engines. Skipping
+        # it silently discards every joint actor step and keeps serving the initial
+        # policy, which the engine/actor log-prob gap then reports as a growing
+        # mismatch.
         self.weights_backuper.backup("actor")
 
         # Update ref model if needed
@@ -570,6 +593,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights_backuper.backup("ref")
 
         log_perf_data(rollout_id, self.args)
+
+        return warmup_signal
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

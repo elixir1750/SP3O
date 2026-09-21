@@ -90,7 +90,7 @@ ARGS+=(
     --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
     --balance-data
     --optimizer adam
-    --lr 1e-6
+    --lr "${LR:-1e-6}"
     --lr-decay-style constant
     --weight-decay 0.1
     --adam-beta1 0.9
@@ -103,7 +103,8 @@ ARGS+=(
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
     --recompute-method uniform
-    --recompute-num-layers 1
+    --recompute-num-layers "${RECOMPUTE_NUM_LAYERS:-1}"
+    --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE:--1}"
     --use-dynamic-batch-size
     --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
     --transformer-impl transformer_engine
@@ -131,9 +132,8 @@ if [[ "$PRESET" == subtb ]]; then
            --subtb-num-windows "${SUBTB_NUM_WINDOWS:-4}"
            --subtb-length-lambda "${SUBTB_LENGTH_LAMBDA:-1.0}"
            --subtb-full-weight "${SUBTB_FULL_WEIGHT:-0.1}")
-    if [[ -n "${SUBTB_FLOW_WARMUP_TARGET_GAP:-}" && "${SUBTB_FLOW_WARMUP_TARGET_GAP}" != none ]]; then
-        ARGS+=(--subtb-flow-warmup-target-gap "${SUBTB_FLOW_WARMUP_TARGET_GAP}"
-               --subtb-flow-warmup-min-steps "${SUBTB_FLOW_WARMUP_MIN_STEPS:-2}")
+    if [[ -n "${SUBTB_ENGINE_GAP_ABORT:-}" && "${SUBTB_ENGINE_GAP_ABORT}" != 0 ]]; then
+        ARGS+=(--subtb-engine-gap-abort "${SUBTB_ENGINE_GAP_ABORT}")
     fi
 else
     ARGS+=(--partial-rollout --use-tis)

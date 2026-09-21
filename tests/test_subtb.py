@@ -1,11 +1,12 @@
 """Mathematical and joint-gradient contracts for the NTP SubTB objective."""
+import math
 from argparse import Namespace
 
 import pytest
 import torch
 
 from slime.utils.subtb import subtb_loss, subtb_spans, validate_subtb_args, validate_subtb_sample, subtb_windows
-from slime.utils.subtb import subtb_flow_warmup_active, subtb_warmup_should_stop
+from slime.utils.subtb import mean_engine_logprob_gap, subtb_flow_warmup_active
 
 NUM_GPUS = 0
 
@@ -78,7 +79,6 @@ def _args(**overrides):
                 actor_num_nodes=1, critic_num_nodes=1,
                 actor_num_gpus_per_node=2, critic_num_gpus_per_node=2,
                 subtb_flow_inner_steps=1, subtb_flow_warmup_steps=0,
-                subtb_flow_warmup_target_gap=None, subtb_flow_warmup_min_steps=2,
                 num_rollout=4, use_critic=True)
     args.update(overrides)
     return Namespace(**args)
@@ -96,11 +96,6 @@ def test_valid_configuration():
     dict(num_critic_only_steps=1), dict(use_tis=True),
     dict(subtb_flow_inner_steps=0), dict(subtb_flow_warmup_steps=-1),
     dict(subtb_flow_warmup_steps=4), dict(subtb_flow_warmup_steps=2, use_critic=False),
-    dict(subtb_flow_warmup_target_gap=0.0, subtb_flow_warmup_steps=2),
-    dict(subtb_flow_warmup_target_gap=float("nan"), subtb_flow_warmup_steps=2),
-    dict(subtb_flow_warmup_target_gap=0.05, subtb_flow_warmup_steps=0),
-    dict(subtb_flow_warmup_target_gap=0.05, subtb_flow_warmup_steps=2, subtb_flow_warmup_min_steps=0),
-    dict(subtb_flow_warmup_target_gap=0.05, subtb_flow_warmup_steps=2, subtb_flow_warmup_min_steps=3),
 ])
 def test_unsupported_configs_fail_early(override):
     with pytest.raises(ValueError):
@@ -121,29 +116,6 @@ def test_flow_warmup_never_applies_to_other_presets():
     for loss_type in ("policy_loss", "sft_loss", "custom_loss"):
         args = _args(loss_type=loss_type, subtb_flow_warmup_steps=2)
         assert not subtb_flow_warmup_active(args, 0)
-
-
-def test_adaptive_warmup_needs_two_consecutive_converged_rounds():
-    # A single lucky round must not end the warmup.
-    assert not subtb_warmup_should_stop([0.04], min_steps=2, target_gap=0.05, rollout_id=0)
-    assert subtb_warmup_should_stop([0.04, 0.03], min_steps=2, target_gap=0.05, rollout_id=1)
-    # The second-to-last round was still far away.
-    assert not subtb_warmup_should_stop([0.30, 0.03], min_steps=2, target_gap=0.05, rollout_id=1)
-    # min_steps is respected even when the flow converged immediately.
-    assert not subtb_warmup_should_stop([0.01, 0.01], min_steps=4, target_gap=0.05, rollout_id=1)
-    assert subtb_warmup_should_stop([0.01, 0.01, 0.01, 0.01], min_steps=4, target_gap=0.05, rollout_id=3)
-    # Feature disabled.
-    assert not subtb_warmup_should_stop([0.0, 0.0], min_steps=2, target_gap=None, rollout_id=5)
-
-
-def test_adaptive_warmup_is_opt_in_and_bounded():
-    # Without a target gap the schedule stays fixed, and the fixed bound is valid.
-    validate_subtb_args(_args(num_rollout=8, subtb_flow_warmup_steps=6,
-                              subtb_flow_warmup_target_gap=0.05))
-    validate_subtb_args(_args(num_rollout=8, subtb_flow_warmup_steps=6, subtb_flow_warmup_min_steps=6,
-                             subtb_flow_warmup_target_gap=0.05))
-    # The adaptive bound never exceeds the fixed warmup budget.
-    validate_subtb_args(_args(subtb_flow_warmup_steps=0, subtb_flow_warmup_min_steps=2))
 
 
 def _group(statuses, rewards, predictions=None):
@@ -381,3 +353,129 @@ def test_default_ppo_head_remains_random_and_zero_reward_has_no_subtb_gradient()
     assert loss.item() == 0
     assert lp.grad.abs().sum() == 0
     assert head.weight.grad.abs().sum() == 0
+
+
+def test_engine_logprob_gap_detects_uniform_sampling_from_empty_engines():
+    # A healthy round: the engine and the actor agree to ~1e-3 nats.
+    engine = [torch.tensor([-1.0, -1.1, -0.9])]
+    actor = [torch.tensor([-1.0005, -1.1004, -0.9004])]
+    mask = [torch.ones(3)]
+    assert abs(mean_engine_logprob_gap(engine, actor, mask)) < 1e-3
+
+    # An engine that lost its weights samples uniformly: every reported log-prob is
+    # exactly -log(vocab_size), while the actor still scores the sampled tokens.
+    vocab = 151936
+    uniform = -math.log(vocab)
+    engine = [torch.full((4,), uniform), torch.full((2,), uniform)]
+    actor = [torch.tensor([-13.2, -12.8, -11.9, -14.1]), torch.tensor([-13.0, -13.4])]
+    mask = [torch.ones(4), torch.ones(2)]
+    gap = mean_engine_logprob_gap(engine, actor, mask)
+    assert abs(gap) > 1.0
+    # Token-weighted: (13.2 + 12.8 + 11.9 + 14.1 + 13.0 + 13.4) / 6 = 13.0666667 nats.
+    assert abs(gap - (uniform + 13.066666666666666)) < 1e-3
+
+
+def test_engine_logprob_gap_respects_the_loss_mask():
+    engine = [torch.tensor([-1.0, -99.0])]
+    actor = [torch.tensor([-1.1, 0.0])]
+    mask = [torch.tensor([1.0, 0.0])]
+    gap = mean_engine_logprob_gap(engine, actor, mask)
+    assert abs(gap - 0.1) < 1e-6
+
+    # Nothing survives the mask -> no verdict rather than a spurious 0.
+    assert mean_engine_logprob_gap(engine, actor, [torch.zeros(2)]) is None
+    assert mean_engine_logprob_gap(None, actor, mask) is None
+
+
+def _actor_classes(path):
+    import ast
+
+    tree = ast.parse(path.read_text())
+    return {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+    }
+
+
+def _dead_code_after_return(body):
+    """True when a statement follows an unconditional return in the same block."""
+    import ast
+
+    seen_return = False
+    for stmt in body:
+        if seen_return:
+            return True
+        if isinstance(stmt, ast.Return):
+            seen_return = True
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(stmt, field, None)
+            if block and _dead_code_after_return(block):
+                return True
+        for handler in getattr(stmt, "handlers", None) or []:
+            if _dead_code_after_return(handler.body):
+                return True
+        for case in getattr(stmt, "cases", None) or []:
+            if _dead_code_after_return(case.body):
+                return True
+    return False
+
+
+def test_actor_train_path_refreshes_the_actor_backup():
+    """Regression: an early `return` used to swallow the backup of the trained actor.
+
+    actor.train_actor must end with ``weights_backuper.backup("actor")``: the next
+    round restores from that CPU copy when it switches back from "ref" to "actor",
+    and update_weights reads the same copy to refill the rollout engines. With the
+    call unreachable every joint optimizer step is silently reverted, and the
+    engines keep serving the initial policy.
+    """
+    import ast
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[1] / "slime/backends/megatron_utils/actor.py"
+    actor = _actor_classes(path)["MegatronTrainRayActor"]
+    train_actor = next(node for node in actor.body if isinstance(node, ast.FunctionDef) and node.name == "train_actor")
+    assert not _dead_code_after_return(train_actor.body), "train_actor returns before its tail runs"
+    backed_up = [
+        node
+        for node in ast.walk(train_actor)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "backup"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "weights_backuper"
+        and node.args
+        and getattr(node.args[0], "value", None) == "actor"
+    ]
+    assert backed_up, "train_actor no longer backs the trained actor weights up"
+
+
+def test_no_function_reads_a_name_that_only_exists_in_another_function():
+    """Regression: the warmup switch helper used a `rollout_id` it never received.
+
+    A free variable that is neither local, parameter, module-level nor builtin is a
+    NameError waiting for the right code path (the helper only ran when the adaptive
+    criterion fired, so the smoke runs stayed green).
+    """
+    import builtins
+    import pathlib
+    import symtable
+
+    path = pathlib.Path(__file__).resolve().parents[1] / "slime/backends/megatron_utils/actor.py"
+    source = path.read_text()
+    module_table = symtable.symtable(source, str(path), "exec")
+    known = {symbol.get_name() for symbol in module_table.get_symbols()} | set(dir(builtins))
+
+    unresolved = []
+
+    def walk(table):
+        for symbol in table.get_symbols():
+            name = symbol.get_name()
+            if symbol.is_referenced() and symbol.is_global() and name not in known:
+                unresolved.append(f"{table.get_name()}: {name}")
+        for child in table.get_children():
+            walk(child)
+
+    walk(module_table)
+    assert not unresolved, f"names that would raise NameError at runtime: {unresolved}"

@@ -75,11 +75,26 @@ tail): with no cap the client may hold 512 requests per engine, which drove the
 ~390k token KV pool to 100% and killed a 100-round job with router 503s (job
 113811). The local launcher therefore pins both to the same value,
 `--sglang-max-running-requests 32 --sglang-server-concurrency 32`. The cap
-must be sized for the *worst* round, not the average: job 113925 hit a degenerate
-batch whose mean response length was 8002 of 8192, where 64 in-flight sequences
-already need ~512k tokens (34 real retractions). Measured throughput on normal
-rounds: cap16 142, cap32 216, cap64 235, cap96 249 tokens/gpu/s, all with zero
-503s, so 32 costs ~13% against 96 but keeps a 34% margin in the bad round.
+should still be sized for the worst *plausible* round rather than the average,
+but note that the 8002-of-8192 round that originally motivated 32 (job 113925)
+was not a long-answer round at all: it was the empty-engine bug described below,
+where every token was uniform noise. With clean engines the curated data
+truncates about 1% of responses (screening 114477), so 32 (256k tokens, ~66% of
+the ~390k pool) is the conservative point on the measured curve: cap16 142,
+cap32 216, cap64 235, cap96 249 tokens/gpu/s, all with zero 503s, i.e. 32 costs
+~13% against 96. Retune it only with a bounded sweep.
+
+Warmup rounds must re-push the actor's weights. Under `--colocate` each round
+releases the engines' memory and, because the launcher runs with
+`--sglang-enable-weights-cpu-backup=False`, `resume_memory_occupation` does not
+bring the weights back: `update_weights` is what refills them. Skipping it in
+warmup (an earlier revision of `train.py` did) makes the engines sample uniform
+noise, which shows up as exactly `-log(151936) = -11.93` per token against the
+actor's recomputed `-13.2`, 94% truncation and reward 0 for 45 minutes per round
+(job 114473; the earlier "degenerate rounds" were the same bug). The launcher now
+passes `--subtb-engine-gap-abort 0.1` and every round logs
+`rollout/engine_logprob_gap`, so the driver stops after one bad round instead of
+training on noise.
 
 Degenerate groups are dropped before training
 (`--dynamic-sampling-filter-path slime.utils.subtb_filter.subtb_group_filter`): every
@@ -112,11 +127,15 @@ which refuses to start unless the capacity/smoke run it points at contains a
 | Rollout | 64 prompts x 8 responses = 512 per round, 1x over-sampling, temperature 1.0, top-p 1.0, context 9216 (prompt <= 1024, response <= 8192) |
 | Engines | 4 x SGLang TP2, `max_running_requests` = client concurrency = 32, mem-fraction 0.7, CUDA graphs disabled, triton attention |
 | Training topology | actor TP2 x DP2 (4 GPUs) + flow/critic TP2 x DP2 (4 GPUs), BF16, sequence parallel, recompute 1 layer, optimizer CPU offload |
+| Joint-step memory | `--recompute-method uniform --recompute-num-layers 1` is the saving setting (the flag is a chunk size, not a count) plus `--log-probs-chunk-size 1024`: on a 44 GB L40S the unbounded fp32 log-prob workspace for one long sample is 1.8-2.8 GB and the joint train step OOMs by ~0.2 GB (jobs 114577, 114740) |
 | Optimizer | Adam (0.9, 0.98), weight decay 0.1, constant LR: actor 1e-6, flow 3e-5 |
 | Per round | actor exactly 1 optimizer step, flow K = 2 steps on the same cached snapshot |
 | Objective | NTP SubTB, alpha 1, zero-initialised flow head, 4 random 64-action windows + mandatory terminal window, lambda 1, full-path weight 0.1, no PPO clipping/GAE/TIS/partial rollout |
-| Two-timescale | warmup <= 12 rounds with the actor frozen (adaptive stop: |mean(g(s0)) - log Z(q)| <= 0.05 for two consecutive rounds, at least 4); joint rounds >= 100, since unused warmup rounds become extra joint rounds |
+| Two-timescale | exactly 12 warmup rounds with the actor frozen (no convergence gate: under a frozen actor the flow's fixed point is the mean reward, while log Z(q) belongs to the joint solution - see SUBTB.md), then >= 100 joint rounds, one actor step and K = 2 flow steps each |
+| Update order | simultaneous within a rollout: the actor's step uses the flow snapshot taken before this rollout's flow steps, the flow leads from the next rollout on (a flow-first ordering would need an extra sync + re-evaluation) |
+| Actor backup | `train_actor` must end with `weights_backuper.backup("actor")`; it is what the next round restores when switching back to "actor" and what `update_weights` ships to the engines |
 | Data hygiene | drop degenerate groups (all 8 truncated, or all 8 unparseable) with a bounded refill budget; forced accepts are logged as "group filter saturated" |
+| Weight-sync rail | every round logs `rollout/engine_logprob_gap` and `--subtb-engine-gap-abort 0.1` aborts the run if the engines stop running the actor's weights (empty engines report exactly `-log(151936) = -11.93` per token, i.e. ~1 nat against the actor) |
 | Evidence | W&B online, metrics per round, checkpoints every 20 joint rounds, evaluation every 20 rounds, per-round sample dumps, gate writes `pilot-evidence.json` + `VALIDATED` |
 
 Totals for the run: 112 rollouts (12 warmup bound + 100 joint), 224 flow steps,

@@ -455,7 +455,29 @@ def log_rollout_data(
                 raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
+        if "rollout_log_probs" in log_dict and "log_probs" in log_dict:
+            # Health metric for the engine/actor weight sync: healthy rounds agree to
+            # ~1e-3 nats, while an engine that lost its weights (empty weights after
+            # release_memory_occupation) samples uniform noise and lands ~1 nat away.
+            log_dict["engine_logprob_gap"] = log_dict["rollout_log_probs"] - log_dict["log_probs"]
+        if "ref_log_probs" in log_dict and "log_probs" in log_dict:
+            # How far the actor has moved from the fixed reference. This is the
+            # "did the joint phase do anything" signal: a joint round whose drift
+            # stays at exactly 0 means the trained weights were not kept (or not
+            # shipped), which the engine/actor gap cannot see because the engines
+            # would be stale in exactly the same way.
+            log_dict["actor_ref_logprob_drift"] = log_dict["log_probs"] - log_dict["ref_log_probs"]
+
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
+        if reduced_log_dict is not None:
+            gap = reduced_log_dict.get("rollout/engine_logprob_gap")
+            if gap is not None and abs(gap) > 0.1:
+                logger.error(
+                    "Rollout engines and the actor disagree by %.4f nats on this round's "
+                    "log-probs; the engines are probably not running the actor's current "
+                    "weights.",
+                    gap,
+                )
         if args.ci_test and reduced_log_dict is not None:
             if (
                 rollout_id == 0

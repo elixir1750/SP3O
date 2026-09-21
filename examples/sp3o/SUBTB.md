@@ -68,8 +68,13 @@ per length. Average window losses equally, then combine with the complete path:
 
 Default eta=0.1 is an initial experimental choice, not a tuned or paper-reported
 optimum. Thus 90% of the coefficient goes to windows, 10% to the complete path;
-actual gradient/loss contributions also depend on residual magnitudes. The full
-path may also appear inside a window for short responses, by design.
+that is a loss coefficient and not a gradient share - the gradient split follows
+the residual magnitudes, and a single full-path term carries a whole trajectory's
+error while a window term carries 64 actions, so 0.1 does not mean "the full path
+contributes 10% of the gradient". The full path may also appear inside a window
+for short responses, by design. A 64-action window also cannot constrain
+mid-range sub-trajectories directly; those are linked through the full-path term
+and through overlapping windows.
 
 Window selection uses a deterministic seed plus sample index shared by actor
 and flow workers. Extra loss storage is O(T + K*W**2); model forward passes
@@ -92,9 +97,19 @@ Before each update, workers cache and exchange current policy log probabilities,
 reference log probabilities and current flow predictions. The actor computes
 its gradient using detached flow predictions; the flow model computes its
 gradient using detached policy probabilities. The actor takes exactly one
-optimizer step per rollout, always against the flow snapshot published at the
-start of that rollout, so both blocks see the same parameters for the data they
-consume.
+optimizer step per rollout.
+
+Ordering, stated precisely: the two models are separate processes (actor on its
+own GPUs, flow on its own) that exchange data once per rollout, so within a
+rollout the update is simultaneous rather than sequential —
+`theta_{k+1} = theta_k - eta * grad L(theta_k, phi_k)` while the flow takes its
+`K` steps on the same cached `theta_k` snapshot to reach `phi_{k+1}`. The actor's
+gradient therefore uses the flow *before* this rollout's flow steps; the flow
+leads only from the next rollout on. Making the actor consume `phi_{k+1}` in the
+same rollout needs a flow-first ordering with an extra sync (the flow would have
+to re-evaluate `g` after its steps and publish it, and the actor would then have
+to wait for that), which serialises the two blocks instead of overlapping them;
+worth doing deliberately, not as a side effect.
 
 Fit the flow before letting the actor move. With a zero-initialised flow and a
 single flow step per rollout, the actor moves the per-trajectory log-ratio
@@ -103,8 +118,9 @@ head moves by order 1e-3 nat per step: the baseline lags by two orders of
 magnitude and the residual is dominated by the un-baselined log-ratio instead of
 the reward tilt. `--subtb-flow-warmup-steps W` therefore keeps the actor frozen
 for the first `W` rollouts (its reference/actor forwards still run and still
-publish log-probs, only its optimizer step and the weight sync to the rollout
-engines are skipped), and `--subtb-flow-inner-steps K` lets the flow take `K`
+publish log-probs, and it still re-synchronises its unchanged weights to the
+rollout engines; only its optimizer step is skipped), and
+`--subtb-flow-inner-steps K` lets the flow take `K`
 optimizer steps per rollout on that rollout's cached actor snapshot. Because the
 flow does not influence sampling, those extra steps need no extra rollouts and
 no actor-side replay. This is a two-timescale scheme, not joint SGD: the loss is
@@ -112,11 +128,54 @@ the same, gradient clipping and the two optimizers still act independently, and
 the actor remains strictly on-policy with one step per rollout.
 
 During warmup the actor is exactly the reference, so the flow loss degenerates
-to a consistency regression whose fixed point is `g(s) -> E[r/alpha | s]` and
-`g(s0) -> log Z(q) = log E_p_ref[exp(r/alpha)]`. `train/subtb_root_value`
-reports `g(s0)`, so warmup is judged against `log(1 - p + p e)` for the observed
-reward rate `p` (about 0.22 at p ~ 0.14), not against the loss level, which is
-already near its reward-variance floor before the flow is fitted.
+to a consistency regression whose fixed point is `g(s) -> E[r/alpha | s]`: the
+root lands on the observed mean reward, not on
+`log Z(q) = log E_p_ref[exp(r/alpha)]`, which is the fixed point of the joint
+solution and is only reached once the actor starts moving. `train/subtb_root_value`
+reports `g(s0)` and the warmup rounds log both scales side by side; see
+"What the warmup can and cannot converge to" below.
+
+### Warmup still has to refill the rollout engines
+
+Under `--colocate` the engines share the training GPUs, so every round releases
+their memory (`release_memory_occupation`) for the trainer and resumes it
+afterwards. With `--sglang-enable-weights-cpu-backup=False` the released weights
+are *not* restored by `resume_memory_occupation`; the contract in
+`slime/ray/rollout.py` is that `update_weights` re-pushes them before the next
+rollout. Skipping that sync during warmup therefore leaves the engines holding
+empty weights: the forward pass returns constant logits, the sampler draws from
+a uniform distribution over the vocabulary, and the round collapses into
+multi-language token soup that runs to the 8192-token cap with reward 0.
+
+That failure is unambiguous in the metrics rather than subtle: every token's
+engine log-prob is exactly `-log(vocab_size)` (= `-11.93` for Qwen3's 151,936
+tokens, a float32 constant to 9 digits), so
+`rollout/rollout_log_probs` is pinned to that value while the actor's
+recomputation of the same tokens reports about `-13.2`. It is *not* an
+engine/trainer numerics gap, so do not "fix" it by shrinking batches, response
+limits or tolerating a mismatch: check the weight sync first. Job 114473 spent
+45 minutes per round generating that soup, and the earlier "degenerate rounds"
+in 113925 were the same bug.
+
+`rollout/engine_logprob_gap` (engine minus actor mean log-prob, token-weighted)
+is logged every round: healthy rounds sit at ~1e-3 nats, an empty engine lands
+near 1 nat. `--subtb-engine-gap-abort 0.1` turns it into a hard stop in the
+driver, so a run aborts after one bad round instead of training on noise for
+hours.
+
+`train_actor` must end with
+`weights_backuper.backup("actor")`. The backup is what the next round restores
+when it switches back from "ref" to "actor" (`_switch_model` -> `restore`) and
+what `update_weights` reads to fill the engines. An early `return` in that
+function (one revision had it, which also left a `rollout_id` reference in the
+helper that swallowed the tail) makes every joint optimizer step evaporate and
+keeps serving the initial policy. Note that the engine/actor gap does *not* see
+this one: engines and actor are both reverted to the same stale copy, so they
+agree with each other while the policy stands still. The signature is
+`rollout/actor_ref_logprob_drift`, the mean `log_probs - ref_log_probs`, which
+stays at exactly 0 in every joint round instead of growing. `tests/test_subtb.py`
+asserts the code shape statically (tail reachable + backup present + no method
+reading a name that only exists elsewhere).
 
 Degenerate groups are dropped before they reach the objective
 (`--dynamic-sampling-filter-path slime.utils.subtb_filter.subtb_group_filter`): a
@@ -138,14 +197,27 @@ p_ref, so they still carry a stabilising gradient) and all-correct groups (a rea
 tilt signal). It is therefore off by default and reachable only through
 `SUBTB_FILTER_ZERO_STD=1` for A/B work.
 
-`--subtb-flow-warmup-target-gap` turns the fixed warmup into a convergence test:
-each warmup round reports `mean(g(s0)) - log Z(q)` (both terms computed from that
-round's own reward rate, so the comparison stays valid while the prompt mix
-changes), and the joint phase starts as soon as two consecutive rounds are within
-the requested gap, after at least `--subtb-flow-warmup-min-steps` rounds.
-`--subtb-flow-warmup-steps` remains the upper bound. Replaying job 113925's two
-warmup rounds (gaps -0.2325, +0.1353) keeps warming up, i.e. the criterion agrees
-that two rounds were not enough.
+### What the warmup can and cannot converge to
+
+The warmup length is the fixed `--subtb-flow-warmup-steps` schedule. An earlier
+revision tried to end it early by demanding `|mean(g(s0)) - log Z(q)| <= gap` for
+two consecutive rounds, and that criterion is wrong: with the actor frozen at
+`p_ref` every log-ratio term vanishes, so the flow's own least-squares fixed point
+is `g(s) -> E[r/alpha | s]` and the root lands on the **mean reward**. `log Z(q)`
+is the fixed point of the *joint* solution, which a frozen actor cannot reach. A
+two-outcome example (rewards 0 and 1, `alpha = 1`, uniform `p_ref`) makes the gap
+irreducible: minimising `0.5 g^2 + 0.5 (g-1)^2` gives `g* = 0.5`, while
+`log Z = log((1 + e)/2) = 0.6201`, so `|g* - log Z| = 0.12 > 0.05` at the exact
+optimum. Pooling the reward rate before taking the log
+(`log E_q[Z(q)] != E_q[log Z(q)]`) adds a second, smaller error.
+
+Warmup is therefore a scale initialisation: it lifts the root from 0 to the
+order of the mean reward before the actor starts moving, and the joint phase then
+pulls `g` up to `log Z(q)` as the actor's log-ratios enter the residual. Both
+scales are logged every warmup round (the actor reports `root`, `reward_rate`,
+`mean_reward_target` and `log_z_joint_target`) and neither is used as a gate.
+If the warmup is ever made adaptive, the quantity to watch is the flow-only loss
+on a fixed validation sample (plateau), not the distance to the joint target.
 
 The first implementation enforces one global batch per rollout, matching
 actor/flow topology, Megatron, CP=PP=1, temperature 1, zero dropout, complete

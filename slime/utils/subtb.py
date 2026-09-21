@@ -10,6 +10,41 @@ import math
 import torch
 
 
+def mean_engine_logprob_gap(engine_log_probs, actor_log_probs, loss_masks):
+    """Mean (rollout-engine log-prob - actor log-prob) over masked response tokens.
+
+    The engines report the log-probs they sampled with; the actor recomputes the same
+    tokens with its current weights. A healthy round agrees to ~1e-3 nats. A systemic
+    gap means the engines are not running the actor's weights: ``--colocate`` releases
+    the engines' memory every round and, with ``--sglang-enable-weights-cpu-backup
+    False``, ``resume_memory_occupation`` hands the weights back empty, so only
+    ``update_weights`` refills them. When that sync is missing the engines sample
+    uniform noise whose per-token log-prob is exactly ``-log(vocab_size)`` (-11.93 for
+    Qwen3), which is what a degenerate "repetition soup" round looks like in the
+    metrics: job 114473 reported -11.93 against the actor's -13.20.
+
+    Returns None when the comparison is not available (no engine log-probs, or nothing
+    survives the loss mask).
+    """
+    if not engine_log_probs or not actor_log_probs or not loss_masks:
+        return None
+
+    delta_sum = 0.0
+    weight_sum = 0.0
+    for engine_sample, actor_sample, mask in zip(engine_log_probs, actor_log_probs, loss_masks):
+        mask = mask.flatten().to(torch.float32)
+        engine_sample = engine_sample.flatten().to(torch.float32)
+        actor_sample = actor_sample.flatten().to(torch.float32)
+        width = min(mask.numel(), engine_sample.numel(), actor_sample.numel())
+        if width == 0:
+            continue
+        delta_sum += float(((engine_sample[:width] - actor_sample[:width]) * mask[:width]).sum())
+        weight_sum += float(mask[:width].sum())
+    if weight_sum == 0:
+        return None
+    return delta_sum / weight_sum
+
+
 def add_subtb_arguments(parser):
     parser.add_argument("--subtb-flow-init", choices=("zero", "random"), default="zero")
     parser.add_argument("--subtb-alpha", type=float, default=1.0)
@@ -38,26 +73,24 @@ def add_subtb_arguments(parser):
         default=0,
         help=(
             "Leading rollouts that only fit the flow: the actor still runs the "
-            "reference/actor forwards that publish log-probs, but takes no optimizer "
-            "step and its weights are not re-synchronised to the rollout engines."
+            "reference/actor forwards that publish log-probs and still re-synchronises "
+            "its (unchanged) weights to the rollout engines, but takes no optimizer "
+            "step. The sync is not optional: under --colocate every round releases and "
+            "resumes the engines' memory without a CPU weight backup, so the engines "
+            "hold empty weights until the next update_weights."
         ),
     )
     parser.add_argument(
-        "--subtb-flow-warmup-target-gap",
+        "--subtb-engine-gap-abort",
         type=float,
-        default=None,
+        default=0.0,
         help=(
-            "Optional adaptive warmup: end the warmup early once the root flow is "
-            "within this absolute distance of log Z(q) for two consecutive rounds. "
-            "Disabled (None) keeps the fixed --subtb-flow-warmup-steps schedule, "
-            "which remains the upper bound."
+            "Safety rail: abort the run when the mean rollout-engine log-prob differs "
+            "from the actor's recomputed log-prob by more than this many nats in a "
+            "round. Healthy rounds sit at ~1e-3; an engine that lost its weights after "
+            "release_memory_occupation samples uniform noise and reports ~1 nat or "
+            "more (every token at -log(vocab_size)). 0 disables the check."
         ),
-    )
-    parser.add_argument(
-        "--subtb-flow-warmup-min-steps",
-        type=int,
-        default=2,
-        help="Minimum number of warmup rounds before the adaptive criterion may fire.",
     )
     return parser
 
@@ -104,15 +137,8 @@ def validate_subtb_args(args):
             raise ValueError("SubTB flow warmup requires the flow model (critic role)")
         if getattr(args, "num_rollout", 0) <= args.subtb_flow_warmup_steps:
             raise ValueError("SubTB flow warmup must leave at least one joint rollout")
-    if args.subtb_flow_warmup_target_gap is not None:
-        if not math.isfinite(args.subtb_flow_warmup_target_gap) or args.subtb_flow_warmup_target_gap <= 0:
-            raise ValueError("SubTB adaptive warmup target gap must be finite and positive")
-        if args.subtb_flow_warmup_steps <= 0:
-            raise ValueError("SubTB adaptive warmup needs --subtb-flow-warmup-steps as its upper bound")
-    if args.subtb_flow_warmup_min_steps < 1:
-        raise ValueError("SubTB adaptive warmup minimum steps must be positive")
-    if args.subtb_flow_warmup_steps > 0 and args.subtb_flow_warmup_min_steps > args.subtb_flow_warmup_steps:
-        raise ValueError("SubTB adaptive warmup minimum steps cannot exceed the warmup bound")
+    if args.subtb_flow_warmup_steps < 0:
+        raise ValueError("SubTB flow warmup steps must be nonnegative")
 
 
 def subtb_flow_warmup_active(args, rollout_id: int) -> bool:
@@ -120,28 +146,13 @@ def subtb_flow_warmup_active(args, rollout_id: int) -> bool:
 
     The actor must still run its forwards during warmup: the flow's residual needs
     the actor's log-probs and the reference log-probs. Only the actor's optimizer
-    step and the weight synchronisation to the rollout engines are skipped.
+    step is skipped; its (unchanged) weights are still re-synchronised to the
+    rollout engines, which ``--colocate`` requires after every release/resume.
     """
     if getattr(args, "loss_type", None) not in ("subtb_loss", "subtb_flow_loss"):
         return False
     warmup_steps = getattr(args, "subtb_flow_warmup_steps", 0) or 0
     return warmup_steps > 0 and rollout_id < warmup_steps
-
-
-def subtb_warmup_should_stop(gap_history, *, min_steps: int, target_gap: float, rollout_id: int) -> bool:
-    """Adaptive warmup criterion: the flow has converged on the tilted target.
-
-    ``gap_history`` holds one mean(g(s0) - log Z(q)) per completed warmup round.
-    The warmup ends when the last two rounds are both within ``target_gap`` and at
-    least ``min_steps`` rounds have been observed, so a single lucky round cannot
-    trigger the switch. Both quantities come from the round's own reward rate, so
-    the comparison stays valid while the prompt mix changes between rounds.
-    """
-    if target_gap is None or target_gap <= 0:
-        return False
-    if len(gap_history) < min_steps or rollout_id + 1 < min_steps:
-        return False
-    return all(abs(gap) <= target_gap for gap in list(gap_history)[-2:])
 
 
 def validate_subtb_sample(sample, eos_id, horizon):

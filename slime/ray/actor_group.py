@@ -129,10 +129,6 @@ class RayTrainGroup:
     def clear_memory(self):
         return ray.get([actor.clear_memory.remote() for actor in self._actor_handlers])
 
-    def set_subtb_warmup_steps(self, steps: int):
-        """Propagate an adaptive SubTB warmup shortening to every actor copy."""
-        return ray.get([actor.set_subtb_warmup_steps.remote(steps) for actor in self._actor_handlers])
-
     def connect(self, critic_group):
         return ray.get(
             [
