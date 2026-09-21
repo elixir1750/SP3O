@@ -9,7 +9,9 @@ SEED="${SEED:-1234}"
 DRY_RUN="${DRY_RUN:-0}"
 MODEL_SIZE="${MODEL_SIZE:-4B}"
 case "${MODEL_SIZE}" in
-    4B|8B) ;;
+    # 4B/8B are the SP3O pilot sizes; the smaller ones exist so the same
+    # launcher can run short code-path checks (script/models presets).
+    0.5B|0.6B|1.7B|4B|8B) ;;
     *) echo "Unsupported MODEL_SIZE: ${MODEL_SIZE}" >&2; exit 2 ;;
 esac
 
@@ -27,7 +29,7 @@ case "${PRESET}" in
 esac
 
 # shellcheck source=/dev/null
-source "${REPO_ROOT}/scripts/models/qwen3-${MODEL_SIZE}.sh"
+source "${REPO_ROOT}/scripts/models/${MODEL_PRESET:-qwen3-${MODEL_SIZE}}.sh"
 MODEL_ARGS+=(--max-position-embeddings "${SEQ_LENGTH:-32768}" --seq-length "${SEQ_LENGTH:-32768}")
 
 CRITIC_RATIOS=(0.3 0.6 0.9)
